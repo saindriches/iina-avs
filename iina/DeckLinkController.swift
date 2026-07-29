@@ -1,0 +1,386 @@
+//
+//  DeckLinkController.swift
+//  iina
+//
+//  Owns the DeckLink output session and the state the menu reflects. One shared instance: the card
+//  is a single exclusive resource, so routing is an app-level setting rather than per-player.
+//
+//  The menu is built in MenuController (see `updateDeckLinkMenu`), following the same
+//  repopulate-on-open idiom as the audio device menu.
+//
+
+import Cocoa
+import OpenGL.GL
+
+/// Persisted across launches so a chosen route survives a restart.
+private struct Keys {
+  static let deviceID = "decklink.deviceIdentifier"
+  static let modeIndex = "decklink.modeIndex"
+  static let pixelFormat = "decklink.pixelFormat"
+  static let range = "decklink.range"
+  static let releaseOnResignActive = "decklink.releaseOnResignActive"
+  static let routingEnabled = "decklink.routingEnabled"
+  static let renderAtOutputRes = "decklink.renderAtOutputResolution"
+  static let lowLatency = "decklink.lowLatency"
+}
+
+class DeckLinkController {
+
+  static let shared = DeckLinkController()
+
+  /// Posted whenever routing starts, stops, or fails, so any open menu/UI can refresh.
+  static let stateDidChange = Notification.Name("iina.decklink.stateDidChange")
+
+  private let output = DeckLinkOutput()
+  /// Pulls mpv's rendered picture out of IINA's render context (see DeckLinkVideoTap).
+  let tap = DeckLinkVideoTap()
+
+  /// Device the user picked, by identifier rather than index: indices shift on hot-plug.
+  private(set) var selectedDeviceID: String?
+  private(set) var selectedModeIndex: Int
+  private(set) var pixelFormat: DeckLinkPixelFormat
+  private(set) var range: DeckLinkVideoRange
+
+  /// Render at the SDI mode's resolution and treat the window as a preview of that, instead of
+  /// rendering for the window and scaling down for the card. Better SDI quality and less total
+  /// work, at the cost of the window showing an upscaled copy when it is larger than the mode.
+  var renderAtOutputResolution: Bool {
+    didSet { UserDefaults.standard.set(renderAtOutputResolution, forKey: Keys.renderAtOutputRes) }
+  }
+
+  /// Immediate display instead of scheduled playback: each captured frame goes to the card's next
+  /// output refresh. Scheduled playback is a queue by design (readback, the ready queue, and the
+  /// card's own depth), so it costs several frames of delay.
+  ///
+  /// The card clocks the SDI signal either way; what this gives up is the queue that absorbs jitter
+  /// in the frames we produce. Our frames are driven by the display refresh and mpv's clock, neither
+  /// locked to the card, so without that cushion a mismatch surfaces as an occasional duplicate or
+  /// skip. Driving capture from the card's clock would remove the penalty rather than the queue.
+  var lowLatency: Bool {
+    didSet {
+      UserDefaults.standard.set(lowLatency, forKey: Keys.lowLatency)
+      restartIfNeeded()
+    }
+  }
+
+  /// Release the device when IINA is not frontmost, so another app can take the card.
+  var releaseWhenInactive: Bool {
+    didSet {
+      UserDefaults.standard.set(releaseWhenInactive, forKey: Keys.releaseOnResignActive)
+      updateActivityObservers()
+    }
+  }
+
+  /// What the user asked for, which is not the same as whether the device is currently open: the
+  /// card can be unplugged, busy, or handed to another app while IINA is in the background. Intent
+  /// is persisted so routing simply resumes, instead of making the user re-check the hardware and
+  /// toggle it on at every launch.
+  private(set) var routingEnabled: Bool
+
+  /// Non-nil while a start attempt has failed, so the menu can say why instead of silently doing
+  /// nothing. Cleared on the next successful start.
+  private(set) var lastError: String?
+
+  var isRunning: Bool { output.isRunning }
+  var isDriverAvailable: Bool { DeckLinkOutput.isDriverAvailable() }
+
+  /// Frames the device reported late or dropped in this session. Surfaced so the UI can be honest
+  /// about whether playout is keeping up.
+  var lateFrames: Int { output.lateFrames }
+  var droppedFrames: Int { output.droppedFrames }
+  var scheduledFrames: Int { output.scheduledFrames }
+  var resyncCount: Int { output.resyncCount }
+  var repeatCount: Int { output.repeatCount }
+  var capturedFrames: Int { tap.capturedFrames }
+
+  private var wasRunningBeforeResign = false
+
+  /// Token from ProcessInfo.beginActivity, held for as long as routing is live. Without it macOS
+  /// applies App Nap once IINA is not frontmost: timers coalesce and background threads are
+  /// throttled, so the tap stops producing frames and the monitor freezes until IINA is focused
+  /// again. `.latencyCritical` is the option that marks this as time-sensitive media work.
+  private var activityToken: NSObjectProtocol?
+
+  private init() {
+    let d = UserDefaults.standard
+    selectedDeviceID = d.string(forKey: Keys.deviceID)
+    selectedModeIndex = d.object(forKey: Keys.modeIndex) as? Int ?? -1
+    pixelFormat = DeckLinkPixelFormat(rawValue: d.object(forKey: Keys.pixelFormat) as? Int ?? 0) ?? .format8BitYUV
+    range = DeckLinkVideoRange(rawValue: d.object(forKey: Keys.range) as? Int ?? 0) ?? .SMPTE
+    releaseWhenInactive = d.bool(forKey: Keys.releaseOnResignActive)
+    routingEnabled = d.bool(forKey: Keys.routingEnabled)
+    renderAtOutputResolution = d.bool(forKey: Keys.renderAtOutputRes)
+    lowLatency = d.bool(forKey: Keys.lowLatency)
+    updateActivityObservers()
+    observeActivationForRestore()
+  }
+
+  // MARK: - enumeration
+
+  var devices: [DeckLinkDevice] { DeckLinkOutput.devices() }
+
+  func modes(forDeviceID identifier: String?) -> [DeckLinkMode] {
+    guard let device = device(withID: identifier) else { return [] }
+    return DeckLinkOutput.modes(forDeviceAt: device.index)
+  }
+
+  func device(withID identifier: String?) -> DeckLinkDevice? {
+    guard let identifier = identifier else { return nil }
+    return devices.first { $0.identifier == identifier }
+  }
+
+  var selectedDevice: DeckLinkDevice? { device(withID: selectedDeviceID) }
+
+  var selectedMode: DeckLinkMode? {
+    let all = modes(forDeviceID: selectedDeviceID)
+    return all.first { $0.index == selectedModeIndex }
+  }
+
+  /// True when this mode can carry the currently chosen pixel format. Used to disable menu rows
+  /// rather than let the user pick a combination the device will refuse.
+  func mode(_ mode: DeckLinkMode, supports format: DeckLinkPixelFormat) -> Bool {
+    switch format {
+    case .format10BitYUV: return mode.supports10BitYUV
+    case .format10BitRGB: return mode.supports10BitRGB
+    default: return mode.supports8BitYUV
+    }
+  }
+
+  // MARK: - selection
+  /// With a single device attached, pick it rather than making the user select before any modes
+  /// appear. Called when the menu opens; a no-op once anything has been chosen.
+  func ensureDefaultSelection() {
+    guard selectedDeviceID == nil else { return }
+    let all = devices
+    guard all.count == 1, let only = all.first else { return }
+    selectDevice(only.identifier)
+  }
+
+
+  func selectDevice(_ identifier: String?) {
+    guard identifier != selectedDeviceID else { return }
+    selectedDeviceID = identifier
+    UserDefaults.standard.set(identifier, forKey: Keys.deviceID)
+    // Mode indices are per-device, so a device change invalidates the chosen mode.
+    selectedModeIndex = -1
+    UserDefaults.standard.set(-1, forKey: Keys.modeIndex)
+    restartIfNeeded()
+  }
+
+  func selectMode(_ index: Int) {
+    guard index != selectedModeIndex else { return }
+    selectedModeIndex = index
+    UserDefaults.standard.set(index, forKey: Keys.modeIndex)
+    restartIfNeeded()
+  }
+
+  func selectPixelFormat(_ format: DeckLinkPixelFormat) {
+    guard format != pixelFormat else { return }
+    pixelFormat = format
+    UserDefaults.standard.set(format.rawValue, forKey: Keys.pixelFormat)
+    restartIfNeeded()
+  }
+
+  func selectRange(_ newRange: DeckLinkVideoRange) {
+    guard newRange != range else { return }
+    range = newRange
+    UserDefaults.standard.set(newRange.rawValue, forKey: Keys.range)
+    restartIfNeeded()
+  }
+
+  // MARK: - session
+
+  /// Whether a start is even possible right now. The menu uses this to keep the toggle disabled
+  /// rather than offering an action that can only fail.
+  var canStart: Bool { selectedDevice != nil && selectedMode != nil }
+
+  /// User asked for output. Records the intent even if the attempt fails, so a device that is
+  /// merely busy right now will be picked up by the next restore.
+  @discardableResult
+  func start() -> Bool {
+    setRoutingEnabled(true)
+    return startDevice()
+  }
+
+  @discardableResult
+  private func startDevice() -> Bool {
+    guard !output.isRunning else { return true }
+    guard let device = selectedDevice, let mode = selectedMode else {
+      lastError = "Choose a device and a video mode first."
+      notifyChanged()
+      return false
+    }
+    guard self.mode(mode, supports: pixelFormat) else {
+      lastError = "\(mode.name) does not support the selected pixel format."
+      notifyChanged()
+      return false
+    }
+
+    // The tap must be live before the device opens: preroll asks the provider for frames straight
+    // away, and an inactive tap fails copyLatest's size guard. Preroll would then schedule nothing,
+    // and a feeder driven by completion callbacks cannot start from an empty queue.
+    tap.immediateReadback = lowLatency   // sub-frame monitoring wants this frame, not the last one
+    tap.activate(width: mode.width, height: mode.height, fps: mode.fps)
+
+    var ok = false
+    do {
+      try output.start(withDeviceIndex: device.index,
+                       modeIndex: mode.index,
+                       pixelFormat: pixelFormat,
+                       range: range,
+                       lowLatency: lowLatency,
+                       provider: frameProvider())
+      ok = true
+      lastError = nil
+      beginBackgroundActivity()
+    } catch {
+      lastError = error.localizedDescription
+      tap.deactivate()   // device never opened; nothing should keep capturing for it
+    }
+    notifyChanged()
+    return ok
+  }
+
+  /// User asked to stop. Clears the intent, so it stays off across launches.
+  func stop() {
+    setRoutingEnabled(false)
+    stopDevice()
+  }
+
+  private func stopDevice() {
+    endBackgroundActivity()
+    guard output.isRunning else { return }
+    // Stop the tap first so no capture races the device teardown.
+    tap.deactivate()
+    output.stop()
+    notifyChanged()
+  }
+
+  /// Hold off App Nap and timer coalescing while frames are going out to hardware.
+  private func beginBackgroundActivity() {
+    guard activityToken == nil else { return }
+    activityToken = ProcessInfo.processInfo.beginActivity(
+      options: [.userInitiated, .latencyCritical],
+      reason: "DeckLink video output is active")
+  }
+
+  private func endBackgroundActivity() {
+    guard let token = activityToken else { return }
+    ProcessInfo.processInfo.endActivity(token)
+    activityToken = nil
+  }
+
+  private func setRoutingEnabled(_ enabled: Bool) {
+    guard enabled != routingEnabled else { return }
+    routingEnabled = enabled
+    UserDefaults.standard.set(enabled, forKey: Keys.routingEnabled)
+  }
+
+  /// Resume routing if the user left it on and the hardware can take it. Safe to call repeatedly:
+  /// it is a no-op when routing is off, already running, or the device is not there. Called at
+  /// launch, when the app becomes active, and whenever the menu opens, so a device plugged in after
+  /// IINA started is picked up without the user toggling anything.
+  func restoreIfNeeded() {
+    guard routingEnabled, !output.isRunning, isDriverAvailable else { return }
+    ensureDefaultSelection()
+    guard canStart else { return }
+    startDevice()
+  }
+
+  func toggle() {
+    if output.isRunning { stop() } else { start() }
+  }
+
+  private func restartIfNeeded() {
+    if output.isRunning {
+      tap.deactivate()
+      output.stop()
+      startDevice()
+    } else {
+      notifyChanged()
+    }
+  }
+
+  private func notifyChanged() {
+    NotificationCenter.default.post(name: DeckLinkController.stateDidChange, object: self)
+  }
+
+  // MARK: - frames
+
+  /// Fills one output frame, on the feeder's thread. Returns false when the tap has nothing yet,
+  /// which makes the feeder repeat its previous frame rather than starve the scheduler. Black is
+  /// emitted only before the first capture, so the monitor still locks while playback starts.
+  private func frameProvider() -> DeckLinkFrameProvider {
+    return { [weak self] buffer, width, height, stride in
+      guard let self = self else { return false }
+      if self.tap.copyLatest(into: buffer, width: width, height: height, stride: stride) {
+        return true
+      }
+      if !self.hasEmittedFirstFrame {
+        memset(buffer, 0, stride * height)
+        return true
+      }
+      return false
+    }
+  }
+
+  /// Latched once the tap has produced anything, so the black fill above is a startup state only.
+  private var hasEmittedFirstFrame: Bool { tap.capturedFrames > 0 }
+
+  /// Called from ViewLayer.draw on the GL thread, after the on-screen render.
+  /// Output-first path: returns true when it rendered for the card and previewed to the window,
+  /// meaning the caller must not render again.
+  func renderForOutput(renderContext: OpaquePointer, screenFBO: GLuint,
+                       screenWidth: Int, screenHeight: Int) -> Bool {
+    guard renderAtOutputResolution, output.isRunning, tap.isActive,
+          screenWidth > 0, screenHeight > 0 else { return false }
+    let rendered = tap.renderForOutput(renderContext: renderContext, screenFBO: screenFBO,
+                                       screenWidth: screenWidth, screenHeight: screenHeight)
+    if rendered && lowLatency { output.displayNow() }
+    return rendered
+  }
+
+  func captureFrameIfRouting(renderContext: OpaquePointer, sourceFBO: GLuint,
+                             sourceWidth: Int, sourceHeight: Int) {
+    guard output.isRunning, tap.isActive, sourceWidth > 0, sourceHeight > 0 else { return }
+    tap.capture(renderContext: renderContext, sourceFBO: sourceFBO,
+                sourceWidth: sourceWidth, sourceHeight: sourceHeight)
+    // Low-latency mode is push-driven: tell the displayer a fresh frame exists the moment it does.
+    if lowLatency { output.displayNow() }
+  }
+
+  // MARK: - focus handling
+
+  private var activationObservers: [NSObjectProtocol] = []
+
+  private func updateActivityObservers() {
+    let center = NotificationCenter.default
+    activationObservers.forEach { center.removeObserver($0) }
+    activationObservers.removeAll()
+    guard releaseWhenInactive else { return }
+    // A hardware output is exclusive, so handing it back when IINA is not frontmost lets another
+    // app (a grading tool, say) take the card without quitting IINA.
+    activationObservers.append(center.addObserver(forName: NSApplication.didResignActiveNotification,
+                                                  object: nil, queue: .main) { [weak self] _ in
+      guard let self = self else { return }
+      self.wasRunningBeforeResign = self.output.isRunning
+      if self.output.isRunning { self.stopDevice() }
+    })
+    activationObservers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                                  object: nil, queue: .main) { [weak self] _ in
+      guard let self = self, self.wasRunningBeforeResign else { return }
+      self.wasRunningBeforeResign = false
+      self.startDevice()
+    })
+  }
+
+  /// Always watch activation for a restore attempt, independent of the release-when-inactive
+  /// setting: if the card was busy or unplugged earlier, coming back to IINA is a natural moment to
+  /// try again.
+  private func observeActivationForRestore() {
+    NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                           object: nil, queue: .main) { [weak self] _ in
+      self?.restoreIfNeeded()
+    }
+  }
+}

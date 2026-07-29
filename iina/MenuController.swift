@@ -279,6 +279,7 @@ class MenuController: NSObject, NSMenuDelegate {
     // Video menu
 
     videoMenu.delegate = self
+    setUpDeckLinkMenu()   // built in code (see MenuController+DeckLink); avoids touching MainMenu.xib
 
     quickSettingsVideo.action = #selector(MainWindowController.menuShowVideoQuickSettings(_:))
     videoTrackMenu.delegate = self
@@ -806,6 +807,12 @@ class MenuController: NSObject, NSMenuDelegate {
   func menuWillOpen(_ menu: NSMenu) {
     // If all menu items are disabled do not update the menus.
     guard !isDisabled else { return }
+    // The DeckLink submenu is created in code, so it is matched by identifier rather than by an
+    // @IBOutlet like the xib-defined menus below.
+    if menu.identifier == MenuController.deckLinkMenuIdentifier {
+      updateDeckLinkMenu(menu)
+      return
+    }
     switch menu {
     case fileMenu:
       updateOpenMenuItems()

@@ -196,6 +196,15 @@ class ViewLayer: CAOpenGLLayer {
         if let context = mpv.mpvRenderContext {
           fbo = i != 0 ? i : fbo
 
+          // Output-first mode renders once at the SDI resolution and previews that to the window,
+          // so skip the normal on-screen render entirely when it takes over.
+          if DeckLinkController.shared.renderForOutput(renderContext: context,
+                                                       screenFBO: GLuint(fbo),
+                                                       screenWidth: Int(dims[2]),
+                                                       screenHeight: Int(dims[3])) {
+            return
+          }
+
           var data = mpv_opengl_fbo(fbo: Int32(fbo),
                                     w: Int32(dims[2]),
                                     h: Int32(dims[3]),
@@ -210,6 +219,12 @@ class ViewLayer: CAOpenGLLayer {
               ]
               mpv_render_context_render(context, &params)
               ignoreGLError()
+              // Second pass for SDI playout, at the output mode's own size. No-op unless DeckLink
+              // routing is running; see DeckLinkVideoTap for the rate limiting and threading.
+              DeckLinkController.shared.captureFrameIfRouting(renderContext: context,
+                                                              sourceFBO: GLuint(fbo),
+                                                              sourceWidth: Int(dims[2]),
+                                                              sourceHeight: Int(dims[3]))
             }
           }
         } else {

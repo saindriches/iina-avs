@@ -1024,3 +1024,17 @@
 "settings.$toThe" = "to the";
 "settings.$top" = "top";
 "settings.$ytdlWarning" = "The Online Media plugin has additional features such as switching quality and video downloading. IINA will use the plugin if it's installed and enabled. The settings below only work if the plugin is not available.";
+
+/* DeckLink output (Video menu) */
+"menu.decklink_output" = "DeckLink Output";
+"menu.decklink_no_driver" = "Blackmagic Desktop Video not installed";
+"menu.decklink_no_device" = "No DeckLink device found";
+"menu.decklink_start" = "Start Output";
+"menu.decklink_stop" = "Stop Output";
+"menu.decklink_status" = "Scheduled %ld, late %ld, dropped %ld";
+"menu.decklink_device" = "Device";
+"menu.decklink_mode" = "Video Mode";
+"menu.decklink_choose" = "Choose a Video Mode";
+"menu.decklink_pixel_format" = "Pixel Format";
+"menu.decklink_levels" = "Levels";
+"menu.decklink_release" = "Release Device When Inactive";
