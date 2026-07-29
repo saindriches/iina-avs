@@ -2931,9 +2931,12 @@ class MainWindowController: PlayerWindowController {
     } else {
       timeLabelYPos = sliderFrame.origin.y + playSlider.frame.height + 5
     }
-    timePreviewView.frame.origin = CGPoint(
-      x: round(sliderFrame.origin.x + sliderFrame.size.width * percentage - timePreviewView.frame.width / 2),
-      y: timeLabelYPos)
+    // Split out with an explicit CGFloat conversion: `percentage` is a Double, and leaving the
+    // implicit Double/CGFloat bridging inside one big expression makes the Swift type-checker give
+    // up on some toolchains ("unable to type-check this expression in reasonable time").
+    let centerX = sliderFrame.origin.x + sliderFrame.size.width * CGFloat(percentage)
+    let originX = round(centerX - timePreviewView.frame.width / 2)
+    timePreviewView.frame.origin = CGPoint(x: originX, y: timeLabelYPos)
   }
 
 
