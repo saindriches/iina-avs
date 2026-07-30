@@ -94,6 +94,7 @@ class DeckLinkController {
   var capturedFrames: Int { tap.capturedFrames }
 
   private var wasRunningBeforeResign = false
+  private var wasRunningBeforeSleep = false
 
   /// Token from ProcessInfo.beginActivity, held for as long as routing is live. Without it macOS
   /// applies App Nap once IINA is not frontmost: timers coalesce and background threads are
@@ -113,6 +114,7 @@ class DeckLinkController {
     lowLatency = d.bool(forKey: Keys.lowLatency)
     updateActivityObservers()
     observeActivationForRestore()
+    observeSleepWake()
   }
 
   // MARK: - enumeration
@@ -254,6 +256,32 @@ class DeckLinkController {
     tap.deactivate()
     output.stop()
     notifyChanged()
+  }
+
+  /// Hand the card back before the machine sleeps, and take it again on wake.
+  ///
+  /// The DeckLink driver talks to hardware over an IOKit connection that does not survive a sleep
+  /// cycle intact. Holding the device across sleep leaves us scheduling frames into a connection
+  /// the driver has torn down, which is a good way to corrupt something rather than merely fail.
+  /// Sleep is also exactly when a hardware output is least useful, so releasing costs nothing.
+  private func observeSleepWake() {
+    let center = NSWorkspace.shared.notificationCenter
+    center.addObserver(forName: NSWorkspace.willSleepNotification,
+                       object: nil, queue: .main) { [weak self] _ in
+      guard let self = self else { return }
+      self.wasRunningBeforeSleep = self.output.isRunning
+      if self.output.isRunning { self.stopDevice() }
+    }
+    center.addObserver(forName: NSWorkspace.didWakeNotification,
+                       object: nil, queue: .main) { [weak self] _ in
+      guard let self = self, self.wasRunningBeforeSleep else { return }
+      self.wasRunningBeforeSleep = false
+      // The driver needs a moment to re-enumerate the device after wake; restoreIfNeeded is a
+      // no-op if it is not back yet, and the activation and menu-open paths will retry.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        self?.restoreIfNeeded()
+      }
+    }
   }
 
   /// Hold off App Nap and timer coalescing while frames are going out to hardware.
