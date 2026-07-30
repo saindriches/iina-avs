@@ -135,16 +135,20 @@ extension MenuController {
       item.state = (format == dl.pixelFormat) ? .on : .off
       item.isEnabled = supported
     }
-    let formatItem = menu.addItem(withTitle: NSLocalizedString("menu.decklink_pixel_format",
-                                                               value: "Pixel Format",
-                                                               comment: "Pixel Format"),
+    let formatName = formats.first { $0.0 == dl.pixelFormat }?.1 ?? "-"
+    let formatItem = menu.addItem(withTitle: String(format: "%@:  %@",
+                                                    NSLocalizedString("menu.decklink_pixel_format",
+                                                                      value: "Pixel Format",
+                                                                      comment: "Pixel Format"),
+                                                    formatName),
                                   action: nil, keyEquivalent: "")
     formatItem.submenu = formatMenu
 
     // -- levels
     let rangeMenu = NSMenu()
     rangeMenu.autoenablesItems = false
-    for (value, title) in [(DeckLinkVideoRange.SMPTE, "SMPTE (legal)"), (.full, "Full")] {
+    let ranges: [(DeckLinkVideoRange, String)] = [(.SMPTE, "SMPTE (legal)"), (.full, "Full")]
+    for (value, title) in ranges {
       let item = rangeMenu.addItem(withTitle: title,
                                    action: #selector(menuDeckLinkSelectRange(_:)), keyEquivalent: "")
       item.target = self
@@ -152,9 +156,12 @@ extension MenuController {
       item.state = (value == dl.range) ? .on : .off
       item.isEnabled = true
     }
-    let rangeItem = menu.addItem(withTitle: NSLocalizedString("menu.decklink_levels",
-                                                              value: "Levels",
-                                                              comment: "Levels"),
+    let rangeName = ranges.first { $0.0 == dl.range }?.1 ?? "-"
+    let rangeItem = menu.addItem(withTitle: String(format: "%@:  %@",
+                                                   NSLocalizedString("menu.decklink_levels",
+                                                                     value: "Levels",
+                                                                     comment: "Levels"),
+                                                   rangeName),
                                  action: nil, keyEquivalent: "")
     rangeItem.submenu = rangeMenu
 
@@ -170,6 +177,60 @@ extension MenuController {
     native.toolTip = NSLocalizedString("menu.decklink_native_render_tip",
                                        value: "Render once at the video mode's resolution and show the window as a preview of it. Better SDI quality and less work than rendering for the window and scaling down.",
                                        comment: "")
+
+    // -- SDI signal configuration. These change the wire format rather than our rendering, and the
+    // device is asked at probe time which of them it implements, so unsupported rows are disabled
+    // rather than offered and silently ignored.
+    let caps = dl.capabilities
+    menu.addItem(.separator())
+    addSectionHeader(to: menu, NSLocalizedString("menu.decklink_sdi", value: "SDI Signal",
+                                                 comment: "SDI signal section"))
+
+    let linkMenu = NSMenu()
+    linkMenu.autoenablesItems = false
+    let links: [(DeckLinkSDILink, String, Bool)] = [
+      (.single, NSLocalizedString("menu.decklink_link_single", value: "Single Link", comment: ""), true),
+      (.dual, NSLocalizedString("menu.decklink_link_dual", value: "Dual Link", comment: ""),
+       caps?.supportsDualLink ?? false),
+      (.quad, NSLocalizedString("menu.decklink_link_quad", value: "Quad Link", comment: ""),
+       caps?.supportsQuadLink ?? false),
+    ]
+    for (value, title, supported) in links {
+      let item = linkMenu.addItem(withTitle: title,
+                                  action: #selector(menuDeckLinkSelectLink(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = value.rawValue
+      item.state = (value == dl.sdiLink) ? .on : .off
+      item.isEnabled = supported
+    }
+    let linkName = links.first { $0.0 == dl.sdiLink }?.1 ?? "-"
+    let linkItem = menu.addItem(withTitle: String(format: "%@:  %@",
+                                                   NSLocalizedString("menu.decklink_link",
+                                                                     value: "SDI Link",
+                                                                     comment: "link configuration"),
+                                                   linkName),
+                                action: nil, keyEquivalent: "")
+    linkItem.submenu = linkMenu
+
+    let item444 = menu.addItem(withTitle: NSLocalizedString("menu.decklink_444",
+                                                            value: "4:4:4 SDI Output", comment: ""),
+                               action: #selector(menuDeckLinkToggle444(_:)), keyEquivalent: "")
+    item444.target = self
+    item444.state = dl.use444 ? .on : .off
+    item444.isEnabled = caps?.supports444SDI ?? false
+    item444.toolTip = NSLocalizedString("menu.decklink_444_tip",
+                                        value: "Send full-bandwidth chroma instead of 4:2:2. Pair with a 10-bit RGB pixel format; on HD rasters this generally needs dual link for the bandwidth.",
+                                        comment: "")
+
+    let itemLevelA = menu.addItem(withTitle: NSLocalizedString("menu.decklink_level_a",
+                                                               value: "Level A for 3G-SDI", comment: ""),
+                                  action: #selector(menuDeckLinkToggleLevelA(_:)), keyEquivalent: "")
+    itemLevelA.target = self
+    itemLevelA.state = dl.levelA ? .on : .off
+    itemLevelA.isEnabled = caps?.supportsLevelA ?? false
+    itemLevelA.toolTip = NSLocalizedString("menu.decklink_level_a_tip",
+                                           value: "SMPTE Level A signalling for 3G-SDI. Level B is the default and more widely accepted; some monitors and routers require A.",
+                                           comment: "")
 
     // -- latency strategy
     let lowLat = menu.addItem(withTitle: NSLocalizedString("menu.decklink_low_latency",
@@ -223,6 +284,22 @@ extension MenuController {
 
   @objc func menuDeckLinkToggleNativeRender(_ sender: NSMenuItem) {
     DeckLinkController.shared.renderAtOutputResolution.toggle()
+  }
+
+  @objc func menuDeckLinkSelectLink(_ sender: NSMenuItem) {
+    guard let raw = sender.representedObject as? Int,
+          let link = DeckLinkSDILink(rawValue: raw) else { return }
+    DeckLinkController.shared.selectSDILink(link)
+  }
+
+  @objc func menuDeckLinkToggle444(_ sender: NSMenuItem) {
+    let dl = DeckLinkController.shared
+    dl.setUse444(!dl.use444)
+  }
+
+  @objc func menuDeckLinkToggleLevelA(_ sender: NSMenuItem) {
+    let dl = DeckLinkController.shared
+    dl.setLevelA(!dl.levelA)
   }
 
   @objc func menuDeckLinkToggleLowLatency(_ sender: NSMenuItem) {

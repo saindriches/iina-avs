@@ -187,6 +187,44 @@ void packR210(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
 
 }  // namespace
 
+/// Acquire the configuration interface. Caller releases. NULL if the device has none.
+static IDeckLinkConfiguration *DLConfigFor(IDeckLink *dl) {
+  IDeckLinkConfiguration *cfg = NULL;
+  if (!dl || dl->QueryInterface(IID_IDeckLinkConfiguration, (void **)&cfg) != S_OK) return NULL;
+  return cfg;
+}
+
+static BMDLinkConfiguration DLBMDLink(DeckLinkSDILink link) {
+  switch (link) {
+    case DeckLinkSDILinkDual: return bmdLinkConfigurationDualLink;
+    case DeckLinkSDILinkQuad: return bmdLinkConfigurationQuadLink;
+    case DeckLinkSDILinkSingle:
+    default:                  return bmdLinkConfigurationSingleLink;
+  }
+}
+
+/// Read a device capability. These are declared attributes, so asking costs nothing and touches no
+/// setting; a device that does not answer is reported as not supporting the feature.
+static BOOL DLAttrFlag(IDeckLinkProfileAttributes *attr, BMDDeckLinkAttributeID id) {
+  bool value = false;
+  if (!attr || attr->GetFlag(id, &value) != S_OK) return NO;
+  return value ? YES : NO;
+}
+
+/// 4:4:4 has no attribute of its own, so ask the output whether it will take an RGB frame in some
+/// mode. Full chroma on the wire needs an RGB pixel format to feed it; a device that cannot accept
+/// one has no way to benefit from the flag.
+static BOOL DLSupports444(IDeckLink *dl) {
+  IDeckLinkOutput *out = NULL;
+  if (dl->QueryInterface(IID_IDeckLinkOutput, (void **)&out) != S_OK || !out) return NO;
+  bool supported = false;
+  BMDDisplayMode actual = bmdModeUnknown;
+  out->DoesSupportVideoMode(bmdVideoConnectionUnspecified, bmdModeHD1080i5994, bmdFormat10BitRGB,
+                            bmdSupportedVideoModeDefault, &actual, &supported);
+  out->Release();
+  return supported ? YES : NO;
+}
+
 #pragma mark - model objects
 
 @implementation DeckLinkDevice
@@ -194,6 +232,15 @@ void packR210(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
   if ((self = [super init])) {
     _index = i; _displayName = [d copy]; _modelName = [m copy];
     _identifier = [[NSString alloc] initWithFormat:@"%@#%ld", m, (long)i];
+  }
+  return self;
+}
+@end
+
+@implementation DeckLinkCapabilities
+- (instancetype)initWith444:(BOOL)f444 levelA:(BOOL)la dual:(BOOL)dl quad:(BOOL)ql {
+  if ((self = [super init])) {
+    _supports444SDI = f444; _supportsLevelA = la; _supportsDualLink = dl; _supportsQuadLink = ql;
   }
   return self;
 }
@@ -499,6 +546,7 @@ private:
 @implementation DeckLinkOutput {
   IDeckLink *_device;
   IDeckLinkOutput *_output;
+  IDeckLinkConfiguration *_config;
   Feeder *_feeder;
   SyncDisplayer *_sync;
   std::vector<IDeckLinkMutableVideoFrame *> _pool;
@@ -596,6 +644,21 @@ private:
   return result;
 }
 
++ (DeckLinkCapabilities *)capabilitiesForDeviceAtIndex:(NSInteger)deviceIndex {
+  IDeckLink *dl = DLDeviceAt(deviceIndex);
+  if (!dl) return nil;
+  IDeckLinkProfileAttributes *attr = NULL;
+  if (dl->QueryInterface(IID_IDeckLinkProfileAttributes, (void **)&attr) != S_OK) attr = NULL;
+  DeckLinkCapabilities *caps =
+      [[DeckLinkCapabilities alloc] initWith444:DLSupports444(dl)
+                                        levelA:DLAttrFlag(attr, BMDDeckLinkSupportsSMPTELevelAOutput)
+                                          dual:DLAttrFlag(attr, BMDDeckLinkSupportsDualLinkSDI)
+                                          quad:DLAttrFlag(attr, BMDDeckLinkSupportsQuadLinkSDI)];
+  if (attr) attr->Release();
+  dl->Release();
+  return caps;
+}
+
 - (void)dealloc {
   [self stop];
 }
@@ -604,6 +667,9 @@ private:
                    modeIndex:(NSInteger)modeIndex
                  pixelFormat:(DeckLinkPixelFormat)pixelFormat
                        range:(DeckLinkVideoRange)range
+                        link:(DeckLinkSDILink)link
+                      use444:(BOOL)use444
+                      levelA:(BOOL)levelA
                   lowLatency:(BOOL)lowLatency
                     provider:(DeckLinkFrameProvider)provider
                        error:(NSError **)error {
@@ -643,7 +709,21 @@ private:
     return NO;
   }
 
+  // Signal configuration must be set BEFORE enabling output: these change the wire format, and the
+  // driver latches them when the output is enabled. Failures are not fatal, since a device that does
+  // not implement a key simply cannot honour it; the menu only offers keys it accepted when probed.
+  // The configuration object must stay alive for the whole session. Releasing it reverts every key
+  // to the stored Desktop Video preference, so writing and releasing here left the card on its saved
+  // settings and made this menu look inert. Held until stop, released after the output is disabled.
+  _config = DLConfigFor(dl);
+  if (_config) {
+    _config->SetInt(bmdDeckLinkConfigSDIOutputLinkConfiguration, DLBMDLink(link));
+    _config->SetFlag(bmdDeckLinkConfig444SDIVideoOutput, use444 ? true : false);
+    _config->SetFlag(bmdDeckLinkConfigSMPTELevelAOutput, levelA ? true : false);
+  }
+
   if (out->EnableVideoOutput(mode->GetDisplayMode(), bmdVideoOutputFlagDefault) != S_OK) {
+    if (_config) { _config->Release(); _config = NULL; }
     mode->Release(); out->Release(); dl->Release();
     if (error) *error = DLError(6, @"could not open the device for output (in use by another app?)");
     return NO;
@@ -666,6 +746,7 @@ private:
                               bmdFrameFlagDefault, &f) != S_OK || !f) {
       for (auto *p : pool) p->Release();
       out->DisableVideoOutput();
+      if (_config) { _config->Release(); _config = NULL; }
       mode->Release(); out->Release(); dl->Release();
       if (error) *error = DLError(7, @"could not allocate output frames");
       return NO;
@@ -745,6 +826,8 @@ private:
   _pool.clear();
   _output->Release();
   _output = NULL;
+  // After the output is disabled, not before: releasing this reverts the wire settings.
+  if (_config) { _config->Release(); _config = NULL; }
   if (_device) { _device->Release(); _device = NULL; }
   _running = NO;
 }

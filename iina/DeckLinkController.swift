@@ -22,6 +22,9 @@ private struct Keys {
   static let routingEnabled = "decklink.routingEnabled"
   static let renderAtOutputRes = "decklink.renderAtOutputResolution"
   static let lowLatency = "decklink.lowLatency"
+  static let sdiLink = "decklink.sdiLink"
+  static let use444 = "decklink.use444SDI"
+  static let levelA = "decklink.levelA"
 }
 
 class DeckLinkController {
@@ -46,6 +49,27 @@ class DeckLinkController {
   /// work, at the cost of the window showing an upscaled copy when it is larger than the mode.
   var renderAtOutputResolution: Bool {
     didSet { UserDefaults.standard.set(renderAtOutputResolution, forKey: Keys.renderAtOutputRes) }
+  }
+
+  /// SDI link configuration. 4:4:4 and high bit depths exceed what a single HD-SDI link carries, so
+  /// dual or quad link is what makes them possible on smaller formats.
+  private(set) var sdiLink: DeckLinkSDILink
+  /// 4:4:4 on the wire instead of 4:2:2, so chroma is not subsampled. Pair it with a 10-bit RGB
+  /// pixel format; on HD rasters it generally needs dual link for the bandwidth.
+  private(set) var use444: Bool
+  /// SMPTE Level A signalling for 3G-SDI. Level B is the default and more widely accepted; some
+  /// monitors and routers want A.
+  private(set) var levelA: Bool
+
+  private var capabilityCache: [String: DeckLinkCapabilities] = [:]
+
+  /// What the selected device will actually accept, read from the hardware and then cached.
+  var capabilities: DeckLinkCapabilities? {
+    guard let device = selectedDevice else { return nil }
+    if let cached = capabilityCache[device.identifier] { return cached }
+    guard let caps = DeckLinkOutput.capabilities(forDeviceAt: device.index) else { return nil }
+    capabilityCache[device.identifier] = caps
+    return caps
   }
 
   /// Immediate display instead of scheduled playback: each captured frame goes to the card's next
@@ -112,6 +136,9 @@ class DeckLinkController {
     routingEnabled = d.bool(forKey: Keys.routingEnabled)
     renderAtOutputResolution = d.bool(forKey: Keys.renderAtOutputRes)
     lowLatency = d.bool(forKey: Keys.lowLatency)
+    sdiLink = DeckLinkSDILink(rawValue: d.object(forKey: Keys.sdiLink) as? Int ?? 0) ?? .single
+    use444 = d.bool(forKey: Keys.use444)
+    levelA = d.bool(forKey: Keys.levelA)
     updateActivityObservers()
     observeActivationForRestore()
     observeSleepWake()
@@ -183,6 +210,27 @@ class DeckLinkController {
     restartIfNeeded()
   }
 
+  func selectSDILink(_ link: DeckLinkSDILink) {
+    guard link != sdiLink else { return }
+    sdiLink = link
+    UserDefaults.standard.set(link.rawValue, forKey: Keys.sdiLink)
+    restartIfNeeded()
+  }
+
+  func setUse444(_ on: Bool) {
+    guard on != use444 else { return }
+    use444 = on
+    UserDefaults.standard.set(on, forKey: Keys.use444)
+    restartIfNeeded()
+  }
+
+  func setLevelA(_ on: Bool) {
+    guard on != levelA else { return }
+    levelA = on
+    UserDefaults.standard.set(on, forKey: Keys.levelA)
+    restartIfNeeded()
+  }
+
   func selectRange(_ newRange: DeckLinkVideoRange) {
     guard newRange != range else { return }
     range = newRange
@@ -230,6 +278,9 @@ class DeckLinkController {
                        modeIndex: mode.index,
                        pixelFormat: pixelFormat,
                        range: range,
+                       link: sdiLink,
+                       use444: use444,
+                       levelA: levelA,
                        lowLatency: lowLatency,
                        provider: frameProvider())
       ok = true

@@ -26,6 +26,15 @@ typedef NS_ENUM(NSInteger, DeckLinkPixelFormat) {
   DeckLinkPixelFormat10BitRGB,      ///< 'r210', 4:4:4 10-bit, SMPTE levels
 };
 
+/// SDI link configuration. 4:4:4 and the higher bit depths need more bandwidth than a single HD-SDI
+/// link carries, which is what dual and quad link are for; the device rejects combinations it cannot
+/// carry, so the menu offers only what it accepts.
+typedef NS_ENUM(NSInteger, DeckLinkSDILink) {
+  DeckLinkSDILinkSingle = 0,
+  DeckLinkSDILinkDual,
+  DeckLinkSDILinkQuad,
+};
+
 /// Video range of the signal we generate. Single-link HD-SDI to a broadcast monitor wants SMPTE.
 typedef NS_ENUM(NSInteger, DeckLinkVideoRange) {
   DeckLinkVideoRangeSMPTE = 0,      ///< legal / studio levels
@@ -55,6 +64,15 @@ typedef NS_ENUM(NSInteger, DeckLinkVideoRange) {
 @property (nonatomic, readonly) BOOL supports8BitYUV;
 @property (nonatomic, readonly) BOOL supports10BitYUV;
 @property (nonatomic, readonly) BOOL supports10BitRGB;
+@end
+
+/// What the attached device can actually be asked to do, probed once per device rather than assumed:
+/// these are IDeckLinkConfiguration capabilities, and they differ a lot between models.
+@interface DeckLinkCapabilities : NSObject
+@property (nonatomic, readonly) BOOL supports444SDI;
+@property (nonatomic, readonly) BOOL supportsLevelA;
+@property (nonatomic, readonly) BOOL supportsDualLink;
+@property (nonatomic, readonly) BOOL supportsQuadLink;
 @end
 
 /// Fills one frame. Called on a worker thread owned by the active output path, never on the card's
@@ -98,10 +116,17 @@ typedef BOOL (^DeckLinkFrameProvider)(void *buffer, NSInteger width, NSInteger h
 
 /// Open the device and begin scheduled playback. `provider` is retained for the session.
 /// Returns NO and populates `error` if the device is busy or rejects the mode/format pair.
+/// Configuration capabilities of a device, or nil if it cannot be opened.
++ (nullable DeckLinkCapabilities *)capabilitiesForDeviceAtIndex:(NSInteger)deviceIndex
+    NS_SWIFT_NAME(capabilities(forDeviceAt:));
+
 - (BOOL)startWithDeviceIndex:(NSInteger)deviceIndex
                    modeIndex:(NSInteger)modeIndex
                  pixelFormat:(DeckLinkPixelFormat)pixelFormat
                        range:(DeckLinkVideoRange)range
+                        link:(DeckLinkSDILink)link
+                      use444:(BOOL)use444
+                      levelA:(BOOL)levelA
                   lowLatency:(BOOL)lowLatency
                     provider:(nullable DeckLinkFrameProvider)provider
                        error:(NSError *_Nullable *_Nullable)error;
