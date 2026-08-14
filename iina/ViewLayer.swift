@@ -198,7 +198,8 @@ class ViewLayer: CAOpenGLLayer {
 
           // Output-first mode renders once at the SDI resolution and previews that to the window,
           // so skip the normal on-screen render entirely when it takes over.
-          if DeckLinkController.shared.renderForOutput(renderContext: context,
+          if DeckLinkController.shared.renderForOutput(for: videoView.player,
+                                                       renderContext: context,
                                                        screenFBO: GLuint(fbo),
                                                        screenWidth: Int(dims[2]),
                                                        screenHeight: Int(dims[3])) {
@@ -221,7 +222,8 @@ class ViewLayer: CAOpenGLLayer {
               ignoreGLError()
               // Second pass for SDI playout, at the output mode's own size. No-op unless DeckLink
               // routing is running; see DeckLinkVideoTap for the rate limiting and threading.
-              DeckLinkController.shared.captureFrameIfRouting(renderContext: context,
+              DeckLinkController.shared.captureFrameIfRouting(for: videoView.player,
+                                                              renderContext: context,
                                                               sourceFBO: GLuint(fbo),
                                                               sourceWidth: Int(dims[2]),
                                                               sourceHeight: Int(dims[3]))

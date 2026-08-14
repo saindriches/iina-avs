@@ -15,6 +15,7 @@ import Cocoa
 extension MenuController {
 
   static let deckLinkMenuIdentifier = NSUserInterfaceItemIdentifier("iina.decklink.menu")
+  static let deckLinkQuickIdentifier = NSUserInterfaceItemIdentifier("iina.decklink.quick")
 
   /// Append "DeckLink Output" to the Video menu. Called once from bindMenuItems().
   func setUpDeckLinkMenu() {
@@ -33,6 +34,29 @@ extension MenuController {
 
     videoMenu.addItem(.separator())
     videoMenu.addItem(item)
+
+    // The same settings as a floating menu at the pointer. Changing output settings is an iterative
+    // job (try a link width, try 4:4:4, look at the monitor, change it back), and every change costs
+    // a walk down Video -> DeckLink Output -> submenu. This puts the whole tree one keystroke away
+    // and leaves it where the pointer already is.
+    let quick = NSMenuItem(title: NSLocalizedString("menu.decklink_quick",
+                                                    value: "DeckLink Quick Settings",
+                                                    comment: "DeckLink Quick Settings"),
+                           action: #selector(menuDeckLinkPopUp(_:)), keyEquivalent: "d")
+    quick.keyEquivalentModifierMask = [.control, .command]
+    quick.target = self
+    quick.identifier = MenuController.deckLinkQuickIdentifier
+    videoMenu.addItem(quick)
+  }
+
+  /// Pop the DeckLink menu up at the pointer. Built through the same `updateDeckLinkMenu` the Video
+  /// menu uses, so the two can never drift apart or report different hardware state.
+  @objc func menuDeckLinkPopUp(_ sender: NSMenuItem) {
+    let menu = NSMenu()
+    menu.autoenablesItems = false
+    updateDeckLinkMenu(menu)
+    // A nil view means screen coordinates, which is where `mouseLocation` already is.
+    menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
   }
 
   /// Rebuild the submenu from what the hardware currently reports.

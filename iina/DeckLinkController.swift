@@ -61,6 +61,41 @@ class DeckLinkController {
   /// monitors and routers want A.
   private(set) var levelA: Bool
 
+  // MARK: - which player feeds the card
+
+  /// The player whose picture goes to the card. One card, one source: without this every open
+  /// player's GL thread drove the output hooks, so two videos interleaved their frames on the wire
+  /// and, in output-first mode, every window skipped its own render to show the SDI preview.
+  ///
+  /// Weak, so a closed player releases it and the next window to come forward takes over.
+  private(set) weak var routedPlayer: PlayerCore?
+
+  /// Follow the frontmost IINA window. Deliberately driven by window activation WITHIN IINA and not
+  /// by app activation: switching between IINA's own windows should re-point the card, but IINA
+  /// losing focus to another app should not, because that case belongs to `releaseWhenInactive`.
+  func windowBecameMain(_ player: PlayerCore) {
+    guard routedPlayer !== player else { return }
+    routedPlayer = player
+    // The old window's last frame is left in place rather than cleared: the new source overwrites it
+    // within a frame or two, and blanking would put a black flash on the monitor at every switch.
+    // The tap scales to the output mode, so a differently sized source needs no handling here.
+    notifyChanged()
+  }
+
+  /// True when `player` is the one currently feeding the card. A player that has never been
+  /// frontmost (or after the routed one closed) adopts the route rather than leaving the card idle.
+  private func claimsRoute(_ player: PlayerCore) -> Bool {
+    if let routed = routedPlayer { return routed === player }
+    routedPlayer = player
+    return true
+  }
+
+  /// Whether this player must render without display colour management, because its picture is
+  /// going to the card. See `VideoView.setBypassColorManagementForDeckLink`.
+  func bypassesColorManagement(for player: PlayerCore) -> Bool {
+    output.isRunning && routedPlayer === player
+  }
+
   private var capabilityCache: [String: DeckLinkCapabilities] = [:]
 
   /// What the selected device will actually accept, read from the hardware and then cached.
@@ -382,6 +417,16 @@ class DeckLinkController {
 
   private func notifyChanged() {
     NotificationCenter.default.post(name: DeckLinkController.stateDidChange, object: self)
+    refreshColorManagement()
+  }
+
+  /// Re-apply each player's colour setup, because whether a player manages colour now depends on
+  /// whether it is the one feeding the card. Every player is refreshed rather than just the routed
+  /// one: the player that just LOST the route has to go back to normal ICC handling too.
+  private func refreshColorManagement() {
+    DispatchQueue.main.async {
+      PlayerCore.playerCores.forEach { $0.refreshEdrMode() }
+    }
   }
 
   // MARK: - frames
@@ -409,19 +454,20 @@ class DeckLinkController {
   /// Called from ViewLayer.draw on the GL thread, after the on-screen render.
   /// Output-first path: returns true when it rendered for the card and previewed to the window,
   /// meaning the caller must not render again.
-  func renderForOutput(renderContext: OpaquePointer, screenFBO: GLuint,
+  func renderForOutput(for player: PlayerCore, renderContext: OpaquePointer, screenFBO: GLuint,
                        screenWidth: Int, screenHeight: Int) -> Bool {
     guard renderAtOutputResolution, output.isRunning, tap.isActive,
-          screenWidth > 0, screenHeight > 0 else { return false }
+          screenWidth > 0, screenHeight > 0, claimsRoute(player) else { return false }
     let rendered = tap.renderForOutput(renderContext: renderContext, screenFBO: screenFBO,
                                        screenWidth: screenWidth, screenHeight: screenHeight)
     if rendered && lowLatency { output.displayNow() }
     return rendered
   }
 
-  func captureFrameIfRouting(renderContext: OpaquePointer, sourceFBO: GLuint,
+  func captureFrameIfRouting(for player: PlayerCore, renderContext: OpaquePointer, sourceFBO: GLuint,
                              sourceWidth: Int, sourceHeight: Int) {
-    guard output.isRunning, tap.isActive, sourceWidth > 0, sourceHeight > 0 else { return }
+    guard output.isRunning, tap.isActive, sourceWidth > 0, sourceHeight > 0,
+          claimsRoute(player) else { return }
     tap.capture(renderContext: renderContext, sourceFBO: sourceFBO,
                 sourceWidth: sourceWidth, sourceHeight: sourceHeight)
     // Low-latency mode is push-driven: tell the displayer a fresh frame exists the moment it does.

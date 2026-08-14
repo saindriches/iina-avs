@@ -309,6 +309,20 @@ class VideoView: NSView {
   }
 
   private func setICCProfile() {
+    // A reference feed exists to escape the display pipeline, and the display ICC profile is the
+    // largest part of it. mpv holds the profile on the render context and applies it inside
+    // mpv_render_context_render, which is the same call the DeckLink tap makes, so with the profile
+    // attached the card receives a picture corrected for THIS Mac's monitor. libmpv allows only one
+    // render context per core (render.h: "there can be only 1 mpv_render_context at a time per mpv
+    // core"), so the two passes cannot disagree about it. The way to keep the wire clean is to stop
+    // mpv converting at all while it is feeding the card.
+    //
+    // The window is then handled the way the HDR path already handles it: mpv is told to leave the
+    // video in its own primaries and transfer, the layer is tagged with the matching colour space,
+    // and macOS converts for the display. So the preview stays correct while the SDI signal carries
+    // the video as decoded. HDR needs nothing here, as `requestEdrMode` already turns ICC off.
+    if setBypassColorManagementForDeckLink() { return }
+
     let screenColorSpace = player.mainWindow.window?.screen?.colorSpace
     if !Preference.bool(for: .loadIccProfile) {
       logHDR("Not using ICC profile due to user preference")
@@ -339,6 +353,43 @@ class VideoView: NSView {
       player.mpv.setString(MPVOption.GPURendererOptions.toneMappingParam, "default")
       player.mpv.setFlag(MPVOption.Screenshot.screenshotTagColorspace, false)
     }
+  }
+
+  /// Leave the picture in the video's own colour space while this player feeds the DeckLink card, so
+  /// the SDI signal is not carrying a correction for the Mac's display. Returns false when it does
+  /// not apply, and the caller falls through to IINA's normal ICC handling.
+  ///
+  /// Only SDR reaches here: `requestEdrMode` already disables ICC for HLG and PQ.
+  private func setBypassColorManagementForDeckLink() -> Bool {
+    guard DeckLinkController.shared.bypassesColorManagement(for: player) else { return false }
+    guard let mpv = player.mpv else { return false }
+    let primaries = mpv.getString(MPVProperty.videoParamsPrimaries) ?? "bt.709"
+    let gamma = mpv.getString(MPVProperty.videoParamsGamma) ?? "bt.1886"
+
+    // What the window layer should be tagged as, which is whatever mpv is now leaving untouched.
+    // Anything unrecognised falls back to sRGB: a wrong tag only mis-converts the preview, and the
+    // card is unaffected either way.
+    let space: CGColorSpace = {
+      switch primaries {
+      case "display-p3": return CGColorSpace(name: CGColorSpace.displayP3) ?? VideoView.SRGB
+      case "bt.2020": return CGColorSpace(name: CGColorSpace.itur_2020) ?? VideoView.SRGB
+      case "bt.709": return CGColorSpace(name: CGColorSpace.itur_709) ?? VideoView.SRGB
+      default: return VideoView.SRGB
+      }
+    }()
+
+    logHDR("DeckLink routing: bypassing colour management (primaries=\(primaries), gamma=\(gamma))")
+    mpv.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, false)
+    // `auto` means "match the source", which is exactly the no-conversion we want. Naming the
+    // measured values instead would bake in whatever mpv reported for the current file and then be
+    // wrong for the next one, since this is not re-run on every file load.
+    mpv.setString(MPVOption.GPURendererOptions.targetPrim, "auto")
+    mpv.setString(MPVOption.GPURendererOptions.targetTrc, "auto")
+    videoLayer.wantsExtendedDynamicRangeContent = false
+    if videoLayer.colorspace != space {
+      videoLayer.colorspace = space
+    }
+    return true
   }
 
   // MARK: - Error Logging

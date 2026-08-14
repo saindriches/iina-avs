@@ -542,6 +542,9 @@ class PlayerWindowController: NSWindowController, NSWindowDelegate {
     PlayerCore.lastActive = player
     NowPlayingInfoManager.shared.updateInfo(withTitle: true)
     AppDelegate.shared.menuController?.updatePluginMenu()
+    // Point the card at the window the user just came to. Only IINA's own windows do this; losing
+    // focus to another app is `releaseWhenInactive`'s business, not a reason to re-route.
+    DeckLinkController.shared.windowBecameMain(player)
 
     NotificationCenter.default.post(name: .iinaMainWindowChanged, object: true)
   }

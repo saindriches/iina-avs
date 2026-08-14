@@ -372,6 +372,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     JavascriptPlugin.loadGlobalInstances()
 
+    // Resume DeckLink routing the user left switched on. This has to be an explicit call: the
+    // controller is a lazy singleton, so until something touches it it does not exist and its
+    // activation observer is not registered. The launch activation has already been delivered by
+    // now, which left the first restore to whatever happened to reference the controller first,
+    // in practice opening the DeckLink menu. The card stayed idle until the pointer went near it.
+    DeckLinkController.shared.restoreIfNeeded()
+
     let mpv = PlayerCore.active.mpv!
     Logger.log("Configuration when building mpv: \(mpv.getString(MPVProperty.mpvConfiguration)!)", level: .verbose)
 
