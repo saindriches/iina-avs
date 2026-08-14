@@ -36,6 +36,8 @@ final class DeckLinkVideoTap {
 
   private var fbo: GLuint = 0
   private var texture: GLuint = 0
+  /// The GL context `fbo`/`texture`/`pbos` were created in. Handles are only meaningful there.
+  private var glContext: CGLContextObj?
   private var allocatedWidth = 0
   private var allocatedHeight = 0
   /// Ping-ponged pixel buffer objects: glReadPixels into one (returns immediately, the GPU fills it
@@ -88,6 +90,15 @@ final class DeckLinkVideoTap {
     if texture != 0 { glDeleteTextures(1, &texture); texture = 0 }
     if fbo != 0 { glDeleteFramebuffers(1, &fbo); fbo = 0 }
     if pbos[0] != 0 || pbos[1] != 0 { glDeleteBuffers(2, &pbos); pbos = [0, 0] }
+    forgetGLResources()
+  }
+
+  /// Drop every handle without touching GL, for when the objects belong to a context that is no
+  /// longer current and must not be deleted through this one.
+  private func forgetGLResources() {
+    texture = 0
+    fbo = 0
+    pbos = [0, 0]
     pboPrimed = false
     pboIndex = 0
     allocatedWidth = 0
@@ -251,6 +262,19 @@ final class DeckLinkVideoTap {
   }
 
   private func ensureFramebuffer(width: Int, height: Int) -> Bool {
+    // GL object names belong to the context that created them, and every player window has its own.
+    // The route can now move between windows, and it moves without changing the SDI size, so the
+    // size check alone would keep reusing an FBO name from the window we just left. Bound in the new
+    // context that name refers to nothing, which is why a second window rendered a torn overlay to
+    // both the preview and the card instead of simply taking over.
+    let current = CGLGetCurrentContext()
+    if current != glContext {
+      // Abandon rather than delete: these names index the OLD context's objects, and deleting them
+      // while a different context is current would either do nothing or destroy an unrelated object
+      // that happens to share the number. They die with their context.
+      forgetGLResources()
+      glContext = current
+    }
     if fbo != 0 && allocatedWidth == width && allocatedHeight == height { return true }
     releaseGLResources()
 

@@ -367,15 +367,16 @@ class VideoView: NSView {
     let gamma = mpv.getString(MPVProperty.videoParamsGamma) ?? "bt.1886"
 
     // What the window layer should be tagged as, which is whatever mpv is now leaving untouched.
-    // Anything unrecognised falls back to sRGB: a wrong tag only mis-converts the preview, and the
-    // card is unaffected either way.
+    //
+    // NOT `itur_709`, which was the first attempt and washed the picture out: that constant carries
+    // the BT.709 transfer function, which is the CAMERA curve (decode gamma about 1.96). SDR video
+    // is encoded for a BT.1886 display at about 2.4, so tagging it 709 has macOS decode far too
+    // aggressively and lift the whole image. sRGB at about 2.2 is the closest stock match and the
+    // tag every other SDR path here already uses. Anything unrecognised falls back to it as well;
+    // a wrong tag only mis-converts the preview, and the card is unaffected either way.
     let space: CGColorSpace = {
-      switch primaries {
-      case "display-p3": return CGColorSpace(name: CGColorSpace.displayP3) ?? VideoView.SRGB
-      case "bt.2020": return CGColorSpace(name: CGColorSpace.itur_2020) ?? VideoView.SRGB
-      case "bt.709": return CGColorSpace(name: CGColorSpace.itur_709) ?? VideoView.SRGB
-      default: return VideoView.SRGB
-      }
+      if primaries == "display-p3" { return CGColorSpace(name: CGColorSpace.displayP3) ?? VideoView.SRGB }
+      return VideoView.SRGB
     }()
 
     logHDR("DeckLink routing: bypassing colour management (primaries=\(primaries), gamma=\(gamma))")

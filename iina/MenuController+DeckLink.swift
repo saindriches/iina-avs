@@ -35,28 +35,25 @@ extension MenuController {
     videoMenu.addItem(.separator())
     videoMenu.addItem(item)
 
-    // The same settings as a floating menu at the pointer. Changing output settings is an iterative
-    // job (try a link width, try 4:4:4, look at the monitor, change it back), and every change costs
-    // a walk down Video -> DeckLink Output -> submenu. This puts the whole tree one keystroke away
-    // and leaves it where the pointer already is.
+    // A window rather than another menu. Finding the combination a monitor accepts means changing a
+    // setting, looking at the picture, and changing it back, repeatedly; a menu (and equally a
+    // pop-up menu) closes on every choice and has to be re-walked each time, which is why the first
+    // attempt at this added nothing. The panel stays open and shows the whole state at once.
+    //
+    // Shift-Cmd-D, because Ctrl-Cmd-D is taken by macOS itself for Look Up and never reached us.
     let quick = NSMenuItem(title: NSLocalizedString("menu.decklink_quick",
-                                                    value: "DeckLink Quick Settings",
-                                                    comment: "DeckLink Quick Settings"),
-                           action: #selector(menuDeckLinkPopUp(_:)), keyEquivalent: "d")
-    quick.keyEquivalentModifierMask = [.control, .command]
+                                                    value: "DeckLink Output Panel",
+                                                    comment: "DeckLink Output Panel"),
+                           action: #selector(menuDeckLinkShowPanel(_:)), keyEquivalent: "d")
+    quick.keyEquivalentModifierMask = [.shift, .command]
     quick.target = self
     quick.identifier = MenuController.deckLinkQuickIdentifier
     videoMenu.addItem(quick)
   }
 
-  /// Pop the DeckLink menu up at the pointer. Built through the same `updateDeckLinkMenu` the Video
-  /// menu uses, so the two can never drift apart or report different hardware state.
-  @objc func menuDeckLinkPopUp(_ sender: NSMenuItem) {
-    let menu = NSMenu()
-    menu.autoenablesItems = false
-    updateDeckLinkMenu(menu)
-    // A nil view means screen coordinates, which is where `mouseLocation` already is.
-    menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+  /// Show or hide the floating settings panel. It drives the same controller the menu does.
+  @objc func menuDeckLinkShowPanel(_ sender: NSMenuItem) {
+    DeckLinkPanelController.shared.toggleVisible()
   }
 
   /// Rebuild the submenu from what the hardware currently reports.

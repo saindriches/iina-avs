@@ -1,0 +1,377 @@
+//
+//  DeckLinkPanel.swift
+//  iina
+//
+//  A floating window holding every DeckLink output setting at once.
+//
+//  The Video menu is fine for setting the output up and forgetting it. It is the wrong shape for the
+//  job this panel exists for: finding the combination a monitor actually likes. That means flipping
+//  link width, then 4:4:4, then the pixel format, looking at the picture between each, and going
+//  back. A menu closes on every choice and has to be re-walked from Video -> DeckLink Output, and a
+//  pop-up menu is no better because it also closes. So this is a panel: it stays where it is put,
+//  survives IINA losing focus, and shows the whole state at once so the interactions between
+//  settings (a mode that a pixel format cannot carry, 4:4:4 needing dual link) are visible rather
+//  than discovered one submenu at a time.
+//
+//  It drives DeckLinkController directly, exactly as the menu does, and rebuilds from
+//  `stateDidChange`, so the two can never disagree about the hardware.
+//
+
+import Cocoa
+
+class DeckLinkPanelController: NSWindowController {
+
+  static let shared = DeckLinkPanelController()
+
+  private var observer: NSObjectProtocol?
+
+  /// Rows whose enabled state depends on hardware capability, rebuilt on every refresh.
+  private var devicePopUp: NSPopUpButton!
+  private var modePopUp: NSPopUpButton!
+  private var formatPopUp: NSPopUpButton!
+  private var rangePopUp: NSPopUpButton!
+  private var linkPopUp: NSPopUpButton!
+  private var use444Box: NSButton!
+  private var levelABox: NSButton!
+  private var nativeRenderBox: NSButton!
+  private var lowLatencyBox: NSButton!
+  private var releaseBox: NSButton!
+  private var toggleButton: NSButton!
+  private var statusLabel: NSTextField!
+
+  private init() {
+    let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 10),
+                        styleMask: [.titled, .closable, .utilityWindow, .hudWindow],
+                        backing: .buffered, defer: false)
+    panel.title = NSLocalizedString("decklink.panel_title", value: "DeckLink Output",
+                                    comment: "DeckLink panel title")
+    // Stays above the video and keeps its state while IINA is in the background, because the
+    // comparison being made is often against another application driving the same monitor.
+    panel.level = .floating
+    panel.hidesOnDeactivate = false
+    panel.isFloatingPanel = true
+    panel.becomesKeyOnlyIfNeeded = true
+    panel.isReleasedWhenClosed = false
+    super.init(window: panel)
+    buildContent()
+    panel.setFrameAutosaveName("DeckLinkPanel")
+  }
+
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  // MARK: - construction
+
+  private func buildContent() {
+    let stack = NSStackView()
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 6
+    stack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+    stack.translatesAutoresizingMaskIntoConstraints = false
+
+    toggleButton = NSButton(title: "", target: self, action: #selector(toggleOutput(_:)))
+    toggleButton.bezelStyle = .rounded
+    stack.addArrangedSubview(toggleButton)
+
+    statusLabel = makeLabel("")
+    statusLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+    statusLabel.textColor = .secondaryLabelColor
+    statusLabel.lineBreakMode = .byWordWrapping
+    statusLabel.preferredMaxLayoutWidth = 300
+    stack.addArrangedSubview(statusLabel)
+
+    stack.addArrangedSubview(separator())
+
+    devicePopUp = addRow(to: stack, NSLocalizedString("menu.decklink_device", value: "Device", comment: "Device"),
+                         action: #selector(selectDevice(_:)))
+    modePopUp = addRow(to: stack, NSLocalizedString("menu.decklink_mode", value: "Video Mode", comment: "Video Mode"),
+                       action: #selector(selectMode(_:)))
+    formatPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_pixel_format", value: "Pixel Format", comment: ""),
+                         action: #selector(selectFormat(_:)))
+    rangePopUp = addRow(to: stack, NSLocalizedString("menu.decklink_levels", value: "Levels", comment: ""),
+                        action: #selector(selectRange(_:)))
+
+    stack.addArrangedSubview(separator())
+    stack.addArrangedSubview(sectionLabel(NSLocalizedString("menu.decklink_sdi", value: "SDI Signal", comment: "")))
+
+    linkPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_link", value: "SDI Link", comment: ""),
+                       action: #selector(selectLink(_:)))
+    use444Box = addCheck(to: stack, NSLocalizedString("menu.decklink_444", value: "4:4:4 SDI Output", comment: ""),
+                         action: #selector(toggle444(_:)))
+    levelABox = addCheck(to: stack, NSLocalizedString("menu.decklink_level_a", value: "Level A for 3G-SDI", comment: ""),
+                         action: #selector(toggleLevelA(_:)))
+
+    stack.addArrangedSubview(separator())
+
+    nativeRenderBox = addCheck(to: stack, NSLocalizedString("menu.decklink_native_render",
+                                                            value: "Render at Output Resolution", comment: ""),
+                               action: #selector(toggleNativeRender(_:)))
+    lowLatencyBox = addCheck(to: stack, NSLocalizedString("menu.decklink_low_latency",
+                                                          value: "Low Latency Mode", comment: ""),
+                             action: #selector(toggleLowLatency(_:)))
+    releaseBox = addCheck(to: stack, NSLocalizedString("menu.decklink_release",
+                                                       value: "Release Device When Inactive", comment: ""),
+                          action: #selector(toggleRelease(_:)))
+
+    guard let content = window?.contentView else { return }
+    content.addSubview(stack)
+    NSLayoutConstraint.activate([
+      stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+      stack.topAnchor.constraint(equalTo: content.topAnchor),
+      stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+    ])
+  }
+
+  private func makeLabel(_ text: String) -> NSTextField {
+    let l = NSTextField(labelWithString: text)
+    l.font = .systemFont(ofSize: 11)
+    return l
+  }
+
+  private func sectionLabel(_ text: String) -> NSTextField {
+    let l = makeLabel(text)
+    l.font = .systemFont(ofSize: 10, weight: .semibold)
+    l.textColor = .secondaryLabelColor
+    return l
+  }
+
+  private func separator() -> NSBox {
+    let b = NSBox()
+    b.boxType = .separator
+    return b
+  }
+
+  private func addRow(to stack: NSStackView, _ title: String, action: Selector) -> NSPopUpButton {
+    stack.addArrangedSubview(sectionLabel(title))
+    let popUp = NSPopUpButton(frame: .zero, pullsDown: false)
+    popUp.target = self
+    popUp.action = action
+    popUp.autoenablesItems = false
+    popUp.translatesAutoresizingMaskIntoConstraints = false
+    popUp.widthAnchor.constraint(equalToConstant: 300).isActive = true
+    stack.addArrangedSubview(popUp)
+    return popUp
+  }
+
+  private func addCheck(to stack: NSStackView, _ title: String, action: Selector) -> NSButton {
+    let box = NSButton(checkboxWithTitle: title, target: self, action: action)
+    box.font = .systemFont(ofSize: 11)
+    stack.addArrangedSubview(box)
+    return box
+  }
+
+  // MARK: - showing
+
+  func toggleVisible() {
+    if window?.isVisible == true {
+      window?.orderOut(nil)
+      return
+    }
+    refresh()
+    // Non-activating: bringing settings up should not steal focus from the video being judged.
+    window?.orderFrontRegardless()
+    if observer == nil {
+      observer = NotificationCenter.default.addObserver(forName: DeckLinkController.stateDidChange,
+                                                        object: nil, queue: .main) { [weak self] _ in
+        self?.refresh()
+      }
+    }
+  }
+
+  // MARK: - state
+
+  /// Rebuild every control from the controller. Cheap, and called on any state change, so the panel
+  /// cannot drift from the hardware the way separately-maintained UI state would.
+  func refresh() {
+    guard window?.isVisible == true else { return }
+    let dl = DeckLinkController.shared
+    dl.ensureDefaultSelection()
+    dl.restoreIfNeeded()
+
+    guard dl.isDriverAvailable else {
+      statusLabel.stringValue = NSLocalizedString("menu.decklink_no_driver",
+                                                  value: "Blackmagic Desktop Video not installed",
+                                                  comment: "")
+      [toggleButton, devicePopUp, modePopUp, formatPopUp, rangePopUp, linkPopUp,
+       use444Box, levelABox, nativeRenderBox, lowLatencyBox, releaseBox].forEach { $0?.isEnabled = false }
+      window?.setContentSize(NSSize(width: 340, height: fittingHeight()))
+      return
+    }
+
+    toggleButton.title = dl.isRunning
+      ? NSLocalizedString("menu.decklink_stop", value: "Stop Output", comment: "")
+      : NSLocalizedString("menu.decklink_start", value: "Start Output", comment: "")
+    toggleButton.isEnabled = dl.isRunning || dl.canStart
+
+    if let error = dl.lastError {
+      statusLabel.stringValue = error
+    } else if dl.isRunning {
+      statusLabel.stringValue = String(format: NSLocalizedString("menu.decklink_status", value: "Scheduled %ld, late %ld, dropped %ld, captured %ld, resync %ld, repeat %ld", comment: ""),
+                                       dl.scheduledFrames, dl.lateFrames, dl.droppedFrames,
+                                       dl.capturedFrames, dl.resyncCount, dl.repeatCount)
+    } else {
+      statusLabel.stringValue = ""
+    }
+
+    // -- device
+    let devices = dl.devices
+    devicePopUp.removeAllItems()
+    for device in devices {
+      devicePopUp.addItem(withTitle: device.displayName)
+      devicePopUp.lastItem?.representedObject = device.identifier
+    }
+    devicePopUp.isEnabled = !devices.isEmpty
+    if let index = devices.firstIndex(where: { $0.identifier == dl.selectedDeviceID }) {
+      devicePopUp.selectItem(at: index)
+    }
+    if devices.isEmpty {
+      statusLabel.stringValue = NSLocalizedString("menu.decklink_no_device",
+                                                  value: "No DeckLink device found", comment: "")
+    }
+
+    // -- video mode. Rows the current pixel format cannot carry stay visible but disabled, so the
+    // reason a mode is unavailable is legible instead of the row simply not being there.
+    let modes = dl.modes(forDeviceID: dl.selectedDeviceID)
+    modePopUp.removeAllItems()
+    for mode in modes {
+      modePopUp.addItem(withTitle: String(format: "%@  (%ld×%ld %@)", mode.name, mode.width,
+                                          mode.height, Self.formatFPS(mode.fps)))
+      modePopUp.lastItem?.representedObject = mode.index
+      modePopUp.lastItem?.isEnabled = dl.mode(mode, supports: dl.pixelFormat)
+    }
+    modePopUp.isEnabled = !modes.isEmpty
+    if let index = modes.firstIndex(where: { $0.index == dl.selectedModeIndex }) {
+      modePopUp.selectItem(at: index)
+    }
+
+    // -- pixel format
+    let formats: [(DeckLinkPixelFormat, String, Bool)] = [
+      (.format8BitYUV, "8-bit YUV 4:2:2", dl.selectedMode?.supports8BitYUV ?? true),
+      (.format10BitYUV, "10-bit YUV 4:2:2", dl.selectedMode?.supports10BitYUV ?? true),
+      (.format10BitRGB, "10-bit RGB 4:4:4", dl.selectedMode?.supports10BitRGB ?? true),
+    ]
+    formatPopUp.removeAllItems()
+    for (format, title, supported) in formats {
+      formatPopUp.addItem(withTitle: title)
+      formatPopUp.lastItem?.representedObject = format.rawValue
+      formatPopUp.lastItem?.isEnabled = supported
+    }
+    if let index = formats.firstIndex(where: { $0.0 == dl.pixelFormat }) {
+      formatPopUp.selectItem(at: index)
+    }
+
+    // -- levels
+    let ranges: [(DeckLinkVideoRange, String)] = [(.SMPTE, "SMPTE (legal)"), (.full, "Full")]
+    rangePopUp.removeAllItems()
+    for (value, title) in ranges {
+      rangePopUp.addItem(withTitle: title)
+      rangePopUp.lastItem?.representedObject = value.rawValue
+    }
+    if let index = ranges.firstIndex(where: { $0.0 == dl.range }) {
+      rangePopUp.selectItem(at: index)
+    }
+
+    // -- SDI signal, gated on what the device says it implements
+    let caps = dl.capabilities
+    let links: [(DeckLinkSDILink, String, Bool)] = [
+      (.single, NSLocalizedString("menu.decklink_link_single", value: "Single Link", comment: ""), true),
+      (.dual, NSLocalizedString("menu.decklink_link_dual", value: "Dual Link", comment: ""), caps?.supportsDualLink ?? false),
+      (.quad, NSLocalizedString("menu.decklink_link_quad", value: "Quad Link", comment: ""), caps?.supportsQuadLink ?? false),
+    ]
+    linkPopUp.removeAllItems()
+    for (value, title, supported) in links {
+      linkPopUp.addItem(withTitle: title)
+      linkPopUp.lastItem?.representedObject = value.rawValue
+      linkPopUp.lastItem?.isEnabled = supported
+    }
+    if let index = links.firstIndex(where: { $0.0 == dl.sdiLink }) {
+      linkPopUp.selectItem(at: index)
+    }
+
+    use444Box.state = dl.use444 ? .on : .off
+    use444Box.isEnabled = caps?.supports444SDI ?? false
+    levelABox.state = dl.levelA ? .on : .off
+    levelABox.isEnabled = caps?.supportsLevelA ?? false
+
+    nativeRenderBox.state = dl.renderAtOutputResolution ? .on : .off
+    lowLatencyBox.state = dl.lowLatency ? .on : .off
+    releaseBox.state = dl.releaseWhenInactive ? .on : .off
+    [nativeRenderBox, lowLatencyBox, releaseBox].forEach { $0?.isEnabled = true }
+
+    window?.setContentSize(NSSize(width: 340, height: fittingHeight()))
+  }
+
+  private func fittingHeight() -> CGFloat {
+    window?.contentView?.fittingSize.height ?? 420
+  }
+
+  /// Same rendering as the menu's: whole rates without decimals, 59.94 and friends with two.
+  private static func formatFPS(_ fps: Double) -> String {
+    let rounded = (fps * 100).rounded() / 100
+    return rounded == rounded.rounded()
+      ? String(format: "%.0f fps", rounded)
+      : String(format: "%.2f fps", rounded)
+  }
+
+  // MARK: - actions
+
+  @objc private func toggleOutput(_ sender: NSButton) { DeckLinkController.shared.toggle(); refresh() }
+
+  @objc private func selectDevice(_ sender: NSPopUpButton) {
+    DeckLinkController.shared.selectDevice(sender.selectedItem?.representedObject as? String)
+    refresh()
+  }
+
+  @objc private func selectMode(_ sender: NSPopUpButton) {
+    guard let index = sender.selectedItem?.representedObject as? Int else { return }
+    DeckLinkController.shared.selectMode(index)
+    refresh()
+  }
+
+  @objc private func selectFormat(_ sender: NSPopUpButton) {
+    guard let raw = sender.selectedItem?.representedObject as? Int,
+          let format = DeckLinkPixelFormat(rawValue: raw) else { return }
+    DeckLinkController.shared.selectPixelFormat(format)
+    refresh()
+  }
+
+  @objc private func selectRange(_ sender: NSPopUpButton) {
+    guard let raw = sender.selectedItem?.representedObject as? Int,
+          let range = DeckLinkVideoRange(rawValue: raw) else { return }
+    DeckLinkController.shared.selectRange(range)
+    refresh()
+  }
+
+  @objc private func selectLink(_ sender: NSPopUpButton) {
+    guard let raw = sender.selectedItem?.representedObject as? Int,
+          let link = DeckLinkSDILink(rawValue: raw) else { return }
+    DeckLinkController.shared.selectSDILink(link)
+    refresh()
+  }
+
+  @objc private func toggle444(_ sender: NSButton) {
+    DeckLinkController.shared.setUse444(sender.state == .on)
+    refresh()
+  }
+
+  @objc private func toggleLevelA(_ sender: NSButton) {
+    DeckLinkController.shared.setLevelA(sender.state == .on)
+    refresh()
+  }
+
+  @objc private func toggleNativeRender(_ sender: NSButton) {
+    DeckLinkController.shared.renderAtOutputResolution = (sender.state == .on)
+    refresh()
+  }
+
+  @objc private func toggleLowLatency(_ sender: NSButton) {
+    DeckLinkController.shared.lowLatency = (sender.state == .on)
+    refresh()
+  }
+
+  @objc private func toggleRelease(_ sender: NSButton) {
+    DeckLinkController.shared.releaseWhenInactive = (sender.state == .on)
+    refresh()
+  }
+}
