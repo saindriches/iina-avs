@@ -80,6 +80,8 @@ static IDeckLinkOutput *DLOutputFor(IDeckLink *dl) {
   return out;
 }
 
+#import <libkern/OSByteOrder.h>
+
 #pragma mark - colour packing
 // Source is packed 10-bit BGRA, one little-endian uint32 per pixel (GL_BGRA +
 // GL_UNSIGNED_INT_2_10_10_10_REV): B in bits 0-9, G in 10-19, R in 20-29, alpha in the top 2.
@@ -98,31 +100,60 @@ inline Coeffs coeffsFor(DeckLinkVideoRange range) {
   return {876.0 / 1023.0, 64.0, 896.0 / 1023.0, 512.0};
 }
 
-/// Unpack one 2:10:10:10 pixel and convert. Components come out in the 0..1023 domain.
-inline void bgraToYCbCr(const uint8_t *p, const Coeffs &c, double &y, double &cb, double &cr) {
-  uint32_t w;
-  memcpy(&w, p, sizeof(w));
-  const double b = double(w & 0x3ffu), g = double((w >> 10) & 0x3ffu), r = double((w >> 20) & 0x3ffu);
-  y  = c.yOff + (0.2126 * r + 0.7152 * g + 0.0722 * b) * c.yScale;
-  cb = c.cOff + (-0.1146 * r - 0.3854 * g + 0.5000 * b) * c.cScale;
-  cr = c.cOff + (0.5000 * r - 0.4542 * g - 0.0458 * b) * c.cScale;
+/// The BT.709 matrix as nine 1024-entry tables, one per (output, input component) pair.
+///
+/// The matrix is separable, so each component's contribution depends only on its own value and can
+/// be looked up. That turns the inner loop from nine double multiplies into nine loads and adds, in
+/// 16.16 fixed point. Worst case magnitude is about 67M, comfortably inside int32.
+struct YCbCrTables {
+  int32_t yr[1024], yg[1024], yb[1024];
+  int32_t cbr[1024], cbg[1024], cbb[1024];
+  int32_t crr[1024], crg[1024], crb[1024];
+  int yOff, cOff;
+};
+
+inline void buildTables(const Coeffs &c, YCbCrTables &t) {
+  const double k = 65536.0;
+  for (int v = 0; v < 1024; v++) {
+    const double d = double(v);
+    t.yr[v]  = int32_t(lround( 0.2126 * d * c.yScale * k));
+    t.yg[v]  = int32_t(lround( 0.7152 * d * c.yScale * k));
+    t.yb[v]  = int32_t(lround( 0.0722 * d * c.yScale * k));
+    t.cbr[v] = int32_t(lround(-0.1146 * d * c.cScale * k));
+    t.cbg[v] = int32_t(lround(-0.3854 * d * c.cScale * k));
+    t.cbb[v] = int32_t(lround( 0.5000 * d * c.cScale * k));
+    t.crr[v] = int32_t(lround( 0.5000 * d * c.cScale * k));
+    t.crg[v] = int32_t(lround(-0.4542 * d * c.cScale * k));
+    t.crb[v] = int32_t(lround(-0.0458 * d * c.cScale * k));
+  }
+  t.yOff = int(lround(c.yOff));
+  t.cOff = int(lround(c.cOff));
 }
 
-inline int clampTo(double v, int lo, int hi) {
-  int i = int(v + 0.5);
+/// Unpack one 2:10:10:10 pixel and convert, in the 0..1023 domain.
+inline void bgraToYCbCr(const uint8_t *p, const YCbCrTables &t, int &y, int &cb, int &cr) {
+  uint32_t w;
+  memcpy(&w, p, sizeof(w));
+  const uint32_t b = w & 0x3ffu, g = (w >> 10) & 0x3ffu, r = (w >> 20) & 0x3ffu;
+  y  = t.yOff + ((t.yr[r]  + t.yg[g]  + t.yb[b]  + 32768) >> 16);
+  cb = t.cOff + ((t.cbr[r] + t.cbg[g] + t.cbb[b] + 32768) >> 16);
+  cr = t.cOff + ((t.crr[r] + t.crg[g] + t.crb[b] + 32768) >> 16);
+}
+
+inline int clampTo(int i, int lo, int hi) {
   return i < lo ? lo : (i > hi ? hi : i);
 }
 
 void packUYVY(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
               long w, long h, DeckLinkVideoRange range) {
-  const Coeffs c = coeffsFor(range);
+  YCbCrTables c; buildTables(coeffsFor(range), c);
   // Clamp in the 10-bit domain and shift down at the end: 64..940 >> 2 lands exactly on 16..235.
   const int lo = (range == DeckLinkVideoRangeFull) ? 0 : 4, hi = 1019;
   for (long y = 0; y < h; y++) {
     const uint8_t *s = src + y * srcStride;
     uint8_t *d = dst + y * dstStride;
     for (long x = 0; x < w; x += 2) {
-      double y0, cb0, cr0, y1, cb1, cr1;
+      int y0, cb0, cr0, y1, cb1, cr1;
       bgraToYCbCr(s + x * 4, c, y0, cb0, cr0);
       bgraToYCbCr(s + (x + 1 < w ? x + 1 : x) * 4, c, y1, cb1, cr1);
       d[x * 2 + 0] = uint8_t(clampTo((cb0 + cb1) / 2, lo, hi) >> 2);
@@ -138,7 +169,7 @@ void packUYVY(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
 //   w2 = Cr2 | Y3<<10 | Cb4<<20      w3 = Y4  | Cr4<<10 | Y5<<20
 void packV210(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
               long w, long h, DeckLinkVideoRange range) {
-  const Coeffs c = coeffsFor(range);
+  YCbCrTables c; buildTables(coeffsFor(range), c);
   const int lo = (range == DeckLinkVideoRangeFull) ? 0 : 4, hi = 1019;
   // Note the two-argument form: `std::vector<int> Y(size_t(w))` is a function declaration.
   std::vector<int> Y(size_t(w), 0);
@@ -147,7 +178,7 @@ void packV210(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
   for (long y = 0; y < h; y++) {
     const uint8_t *s = src + y * srcStride;
     for (long x = 0; x < w; x += 2) {
-      double y0, cb0, cr0, y1, cb1, cr1;
+      int y0, cb0, cr0, y1, cb1, cr1;
       bgraToYCbCr(s + x * 4, c, y0, cb0, cr0);
       bgraToYCbCr(s + (x + 1 < w ? x + 1 : x) * 4, c, y1, cb1, cr1);
       Y[size_t(x)] = clampTo(y0, lo, hi);
@@ -173,24 +204,38 @@ void packV210(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
 void packR210(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
               long w, long h, DeckLinkVideoRange range) {
   const bool smpte = (range != DeckLinkVideoRangeFull);
+
+  // r210 is the format we already have. The SDK calls it "Big-endian RGB 10-bit per component,
+  // packed as 2:10:10:10", which is bit for bit what GL_BGRA + GL_UNSIGNED_INT_2_10_10_10_REV hands
+  // back: R at 20, G at 10, B at 0. So full range is nothing but a byte swap, and the whole
+  // per-pixel matrix that used to live here was work to arrive back where we started.
+  if (!smpte) {
+    for (long y = 0; y < h; y++) {
+      const uint32_t *s32 = (const uint32_t *)(src + y * srcStride);
+      uint32_t *d32 = (uint32_t *)(dst + y * dstStride);
+      for (long x = 0; x < w; x++) {
+        d32[x] = OSSwapHostToBigInt32(s32[x] & 0x3FFFFFFFu);   // drop alpha, swap
+      }
+    }
+    return;
+  }
+
+  // SMPTE needs each component squeezed into 64..940, which is a per-component map and therefore a
+  // table. 1024 entries, pre-shifted into position, so the inner loop is three lookups and two ors
+  // rather than three double multiplies.
+  uint32_t tR[1024], tG[1024], tB[1024];
+  for (int v = 0; v < 1024; v++) {
+    int i = int(64.0 + double(v) * (940.0 - 64.0) / 1023.0 + 0.5);
+    const uint32_t c = uint32_t(i < 0 ? 0 : (i > 1023 ? 1023 : i));
+    tR[v] = c << 20; tG[v] = c << 10; tB[v] = c;
+  }
   for (long y = 0; y < h; y++) {
-    const uint8_t *s = src + y * srcStride;
-    uint8_t *d = dst + y * dstStride;
+    const uint32_t *s32 = (const uint32_t *)(src + y * srcStride);
+    uint32_t *d32 = (uint32_t *)(dst + y * dstStride);
     for (long x = 0; x < w; x++) {
-      uint32_t px;
-      memcpy(&px, s + x * 4, sizeof(px));
-      auto up = [&](uint32_t v) -> uint32_t {
-        // 10-bit full range in; SMPTE compresses into 64..940, full range passes straight through.
-        if (!smpte) return v > 1023u ? 1023u : v;
-        int i = int(64.0 + double(v) * (940.0 - 64.0) / 1023.0 + 0.5);
-        return uint32_t(i < 0 ? 0 : (i > 1023 ? 1023 : i));
-      };
-      const uint32_t b10 = px & 0x3ffu, g10 = (px >> 10) & 0x3ffu, r10 = (px >> 20) & 0x3ffu;
-      const uint32_t word = (up(r10) << 20) | (up(g10) << 10) | up(b10);
-      d[x * 4 + 0] = uint8_t((word >> 24) & 0xff);
-      d[x * 4 + 1] = uint8_t((word >> 16) & 0xff);
-      d[x * 4 + 2] = uint8_t((word >> 8) & 0xff);
-      d[x * 4 + 3] = uint8_t(word & 0xff);
+      const uint32_t px = s32[x];
+      const uint32_t word = tR[(px >> 20) & 0x3ffu] | tG[(px >> 10) & 0x3ffu] | tB[px & 0x3ffu];
+      d32[x] = OSSwapHostToBigInt32(word);
     }
   }
 }
