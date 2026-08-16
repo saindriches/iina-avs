@@ -76,6 +76,9 @@ final class DeckLinkVideoTap {
   var immediateReadback = false
 
   private let lock = NSLock()
+  /// Whether the most recent store finished a frame rather than leaving a seeded second field.
+  /// Always true when not weaving. The card should only be asked to display on a complete frame.
+  private(set) var frameComplete = true
   private var buffer = [UInt8]()
   /// Landing area for a readback, so weaving can merge into `buffer` without destroying the field
   /// already sitting there.
@@ -183,6 +186,10 @@ final class DeckLinkVideoTap {
       }
     }
     if weaveFields { fieldParity ^= 1 }
+    // Parity back at 0 means the second field of the pair has just landed. While it is 1 the frame
+    // still carries the seed, and showing it then is what made the card alternate between a true
+    // pair and a half-built one.
+    frameComplete = !weaveFields || fieldParity == 0
     hasFrame = true
     capturedFrames += 1
   }

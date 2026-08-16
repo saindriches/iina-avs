@@ -511,7 +511,10 @@ class DeckLinkController {
           screenWidth > 0, screenHeight > 0, claimsRoute(player) else { return false }
     let rendered = tap.renderForOutput(renderContext: renderContext, screenFBO: screenFBO,
                                        screenWidth: screenWidth, screenHeight: screenHeight)
-    if rendered && lowLatency { output.displayNow() }
+    // Only ask for a display once the frame is whole. Firing per capture meant a display per FIELD,
+    // roughly 54 a second into a mode that emits 29.97 frames, so half of them showed a frame whose
+    // second field was still the seed. That is what read as dropped frames.
+    if rendered && lowLatency && tap.frameComplete { output.displayNow() }
     return rendered
   }
 
@@ -521,8 +524,9 @@ class DeckLinkController {
           claimsRoute(player) else { return }
     tap.capture(renderContext: renderContext, sourceFBO: sourceFBO,
                 sourceWidth: sourceWidth, sourceHeight: sourceHeight)
-    // Low-latency mode is push-driven: tell the displayer a fresh frame exists the moment it does.
-    if lowLatency { output.displayNow() }
+    // Low-latency mode is push-driven: tell the displayer a fresh frame exists the moment it does,
+    // but only once it IS one. See renderForOutput above.
+    if lowLatency && tap.frameComplete { output.displayNow() }
   }
 
   // MARK: - focus handling
