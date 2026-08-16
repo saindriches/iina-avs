@@ -173,7 +173,9 @@ final class DeckLinkVideoTap {
     // Unflipped, so the bottom-up glReadPixels below lands top-down for the card. The screen blit
     // afterwards flips it back for display.
     var flip: CInt = 0
-    var depth: CInt = 8
+    // 10, matching the RGB10_A2 target: this is what mpv dithers to, so leaving it at 8 threw the
+    // extra bits away before they were ever written.
+    var depth: CInt = 10
     var data = mpv_opengl_fbo(fbo: Int32(fbo), w: Int32(w), h: Int32(h), internal_format: 0)
     withUnsafeMutablePointer(to: &data) { dataPtr in
       withUnsafeMutablePointer(to: &flip) { flipPtr in
@@ -220,7 +222,7 @@ final class DeckLinkVideoTap {
         buffer.withUnsafeMutableBytes { raw in
           if let base = raw.baseAddress {
             glReadPixels(0, 0, GLsizei(w), GLsizei(h), GLenum(GL_BGRA),
-                         GLenum(GL_UNSIGNED_INT_8_8_8_8_REV), base)
+                         GLenum(GL_UNSIGNED_INT_2_10_10_10_REV), base)
           }
         }
         hasFrame = true
@@ -238,7 +240,7 @@ final class DeckLinkVideoTap {
     // Kick off this frame's readback; it does not block.
     glBindBuffer(GLenum(GL_PIXEL_PACK_BUFFER), pbos[writeIndex])
     glReadPixels(0, 0, GLsizei(w), GLsizei(h), GLenum(GL_BGRA),
-                 GLenum(GL_UNSIGNED_INT_8_8_8_8_REV), nil)
+                 GLenum(GL_UNSIGNED_INT_2_10_10_10_REV), nil)
 
     // Collect the one issued last time, which the GPU has had a full frame to finish.
     if pboPrimed {
@@ -278,22 +280,44 @@ final class DeckLinkVideoTap {
     if fbo != 0 && allocatedWidth == width && allocatedHeight == height { return true }
     releaseGLResources()
 
-    glGenTextures(1, &texture)
-    glBindTexture(GLenum(GL_TEXTURE_2D), texture)
-    glTexImage2D(GLenum(GL_TEXTURE_2D), 0, GL_RGBA8, GLsizei(width), GLsizei(height), 0,
-                 GLenum(GL_BGRA), GLenum(GL_UNSIGNED_INT_8_8_8_8_REV), nil)
-    glTexParameteri(GLenum(GL_TEXTURE_2D), GLenum(GL_TEXTURE_MIN_FILTER), GL_LINEAR)
-    glTexParameteri(GLenum(GL_TEXTURE_2D), GLenum(GL_TEXTURE_MAG_FILTER), GL_LINEAR)
+    // RGB10_A2, not RGBA8. The card's 10-bit formats were being fed 8-bit data promoted into
+    // 10-bit words, so selecting "10-bit" bought nothing but a wider container. Same 32 bits per
+    // pixel, so every size calculation downstream is unchanged.
+    //
+    // If the driver will not render to it, fall back to RGBA8 rather than losing output entirely.
+    // Nothing downstream has to know: `glReadPixels` converts from the attachment's internal format
+    // to whatever external format is asked for, so reading 2:10:10:10 off an 8-bit attachment still
+    // yields correctly scaled values in the 10-bit domain. Only the precision is lost, not the
+    // format contract.
+    var complete = false
+    for internalFormat in [GL_RGB10_A2, GL_RGBA8] {
+      releaseGLResources()
+      glGenTextures(1, &texture)
+      glBindTexture(GLenum(GL_TEXTURE_2D), texture)
+      glTexImage2D(GLenum(GL_TEXTURE_2D), 0, internalFormat, GLsizei(width), GLsizei(height), 0,
+                   GLenum(GL_BGRA), GLenum(GL_UNSIGNED_INT_2_10_10_10_REV), nil)
+      glTexParameteri(GLenum(GL_TEXTURE_2D), GLenum(GL_TEXTURE_MIN_FILTER), GL_LINEAR)
+      glTexParameteri(GLenum(GL_TEXTURE_2D), GLenum(GL_TEXTURE_MAG_FILTER), GL_LINEAR)
 
-    glGenFramebuffers(1, &fbo)
-    glBindFramebuffer(GLenum(GL_FRAMEBUFFER), fbo)
-    glFramebufferTexture2D(GLenum(GL_FRAMEBUFFER), GLenum(GL_COLOR_ATTACHMENT0),
-                           GLenum(GL_TEXTURE_2D), texture, 0)
-
-    let status = glCheckFramebufferStatus(GLenum(GL_FRAMEBUFFER))
-    glBindFramebuffer(GLenum(GL_FRAMEBUFFER), 0)
-    guard status == GLenum(GL_FRAMEBUFFER_COMPLETE) else {
-      Logger.log("DeckLink: offscreen framebuffer incomplete (status \(status))", level: .error)
+      glGenFramebuffers(1, &fbo)
+      glBindFramebuffer(GLenum(GL_FRAMEBUFFER), fbo)
+      glFramebufferTexture2D(GLenum(GL_FRAMEBUFFER), GLenum(GL_COLOR_ATTACHMENT0),
+                             GLenum(GL_TEXTURE_2D), texture, 0)
+      let status = glCheckFramebufferStatus(GLenum(GL_FRAMEBUFFER))
+      glBindFramebuffer(GLenum(GL_FRAMEBUFFER), 0)
+      if status == GLenum(GL_FRAMEBUFFER_COMPLETE) {
+        complete = true
+        if internalFormat == GL_RGBA8 {
+          Logger.log("DeckLink: 10-bit offscreen target unavailable, falling back to 8-bit",
+                     level: .warning)
+        }
+        break
+      }
+      Logger.log("DeckLink: offscreen framebuffer incomplete for internal format \(internalFormat) (status \(status))",
+                 level: .warning)
+    }
+    guard complete else {
+      Logger.log("DeckLink: could not create an offscreen framebuffer", level: .error)
       releaseGLResources()
       return false
     }

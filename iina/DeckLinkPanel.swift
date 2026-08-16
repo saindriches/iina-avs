@@ -24,6 +24,7 @@ class DeckLinkPanelController: NSWindowController {
   static let shared = DeckLinkPanelController()
 
   private var observer: NSObjectProtocol?
+  private var statusTimer: Timer?
 
   /// Rows whose enabled state depends on hardware capability, rebuilt on every refresh.
   private var devicePopUp: NSPopUpButton!
@@ -165,18 +166,40 @@ class DeckLinkPanelController: NSWindowController {
 
   func toggleVisible() {
     if window?.isVisible == true {
-      window?.orderOut(nil)
+      hide()
       return
     }
-    refresh()
-    // Non-activating: bringing settings up should not steal focus from the video being judged.
+    // Show BEFORE refreshing: `refresh` declines to work on a hidden window, so populating first
+    // left the panel blank until something else triggered it, which in practice meant pressing
+    // Stop/Start. Non-activating, because bringing settings up should not steal focus from the
+    // video being judged.
     window?.orderFrontRegardless()
+    refresh()
     if observer == nil {
       observer = NotificationCenter.default.addObserver(forName: DeckLinkController.stateDidChange,
                                                         object: nil, queue: .main) { [weak self] _ in
         self?.refresh()
       }
     }
+    startStatusTimer()
+  }
+
+  private func hide() {
+    window?.orderOut(nil)
+    statusTimer?.invalidate()
+    statusTimer = nil
+  }
+
+  /// The playout counters move constantly while running, so they are polled rather than waiting for
+  /// a state change that may never come. Only the status line is rewritten: a full rebuild every
+  /// second would tear down the pop-up menus underneath the user's cursor.
+  private func startStatusTimer() {
+    statusTimer?.invalidate()
+    let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+      self?.refreshStatus()
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    statusTimer = timer
   }
 
   // MARK: - state
@@ -190,9 +213,6 @@ class DeckLinkPanelController: NSWindowController {
     dl.restoreIfNeeded()
 
     guard dl.isDriverAvailable else {
-      statusLabel.stringValue = NSLocalizedString("menu.decklink_no_driver",
-                                                  value: "Blackmagic Desktop Video not installed",
-                                                  comment: "")
       [toggleButton, devicePopUp, modePopUp, formatPopUp, rangePopUp, linkPopUp,
        use444Box, levelABox, nativeRenderBox, lowLatencyBox, releaseBox].forEach { $0?.isEnabled = false }
       window?.setContentSize(NSSize(width: 340, height: fittingHeight()))
@@ -204,15 +224,7 @@ class DeckLinkPanelController: NSWindowController {
       : NSLocalizedString("menu.decklink_start", value: "Start Output", comment: "")
     toggleButton.isEnabled = dl.isRunning || dl.canStart
 
-    if let error = dl.lastError {
-      statusLabel.stringValue = error
-    } else if dl.isRunning {
-      statusLabel.stringValue = String(format: NSLocalizedString("menu.decklink_status", value: "Scheduled %ld, late %ld, dropped %ld, captured %ld, resync %ld, repeat %ld", comment: ""),
-                                       dl.scheduledFrames, dl.lateFrames, dl.droppedFrames,
-                                       dl.capturedFrames, dl.resyncCount, dl.repeatCount)
-    } else {
-      statusLabel.stringValue = ""
-    }
+    refreshStatus()
 
     // -- device
     let devices = dl.devices
@@ -224,10 +236,6 @@ class DeckLinkPanelController: NSWindowController {
     devicePopUp.isEnabled = !devices.isEmpty
     if let index = devices.firstIndex(where: { $0.identifier == dl.selectedDeviceID }) {
       devicePopUp.selectItem(at: index)
-    }
-    if devices.isEmpty {
-      statusLabel.stringValue = NSLocalizedString("menu.decklink_no_device",
-                                                  value: "No DeckLink device found", comment: "")
     }
 
     // -- video mode. Rows the current pixel format cannot carry stay visible but disabled, so the
@@ -300,6 +308,29 @@ class DeckLinkPanelController: NSWindowController {
     [nativeRenderBox, lowLatencyBox, releaseBox].forEach { $0?.isEnabled = true }
 
     window?.setContentSize(NSSize(width: 340, height: fittingHeight()))
+  }
+
+  /// Just the counters, cheap enough to run every second.
+  private func refreshStatus() {
+    guard window?.isVisible == true, statusLabel != nil else { return }
+    let dl = DeckLinkController.shared
+    if let error = dl.lastError {
+      statusLabel.stringValue = error
+    } else if dl.isRunning {
+      statusLabel.stringValue = String(format: NSLocalizedString("menu.decklink_status", value: "Scheduled %ld, late %ld, dropped %ld, captured %ld, resync %ld, repeat %ld", comment: ""),
+                                       dl.scheduledFrames, dl.lateFrames, dl.droppedFrames,
+                                       dl.capturedFrames, dl.resyncCount, dl.repeatCount)
+    } else if !dl.isDriverAvailable {
+      statusLabel.stringValue = NSLocalizedString("menu.decklink_no_driver",
+                                                  value: "Blackmagic Desktop Video not installed",
+                                                  comment: "")
+    } else if dl.devices.isEmpty {
+      statusLabel.stringValue = NSLocalizedString("menu.decklink_no_device",
+                                                  value: "No DeckLink device found", comment: "")
+    } else {
+      statusLabel.stringValue = NSLocalizedString("decklink.panel_idle", value: "Output stopped",
+                                                  comment: "DeckLink idle status")
+    }
   }
 
   private func fittingHeight() -> CGFloat {

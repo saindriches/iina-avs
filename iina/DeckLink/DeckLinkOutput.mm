@@ -81,20 +81,28 @@ static IDeckLinkOutput *DLOutputFor(IDeckLink *dl) {
 }
 
 #pragma mark - colour packing
-// Source is BGRA8 (what a GL readback and mpv's "bgr0" both give). Matrix is BT.709; SMPTE range
-// maps to Y 16..235 / C 16..240, full range keeps 0..255. 4:2:2 averages chroma across each pair.
+// Source is packed 10-bit BGRA, one little-endian uint32 per pixel (GL_BGRA +
+// GL_UNSIGNED_INT_2_10_10_10_REV): B in bits 0-9, G in 10-19, R in 20-29, alpha in the top 2.
+//
+// It used to be BGRA8, and the 10-bit packers simply multiplied by four, so choosing a 10-bit
+// output format widened the container without adding a single bit of picture. Everything here now
+// works in the 0..1023 domain end to end. Matrix is BT.709; SMPTE range maps to Y 64..940 /
+// C 64..960, full range keeps 0..1023. 4:2:2 averages chroma across each pair.
 
 namespace {
 
 struct Coeffs { double yScale, yOff, cScale, cOff; };
 
 inline Coeffs coeffsFor(DeckLinkVideoRange range) {
-  if (range == DeckLinkVideoRangeFull) return {255.0 / 255.0, 0.0, 255.0 / 255.0, 128.0};
-  return {219.0 / 255.0, 16.0, 224.0 / 255.0, 128.0};
+  if (range == DeckLinkVideoRangeFull) return {1.0, 0.0, 1.0, 512.0};
+  return {876.0 / 1023.0, 64.0, 896.0 / 1023.0, 512.0};
 }
 
+/// Unpack one 2:10:10:10 pixel and convert. Components come out in the 0..1023 domain.
 inline void bgraToYCbCr(const uint8_t *p, const Coeffs &c, double &y, double &cb, double &cr) {
-  const double b = p[0], g = p[1], r = p[2];
+  uint32_t w;
+  memcpy(&w, p, sizeof(w));
+  const double b = double(w & 0x3ffu), g = double((w >> 10) & 0x3ffu), r = double((w >> 20) & 0x3ffu);
   y  = c.yOff + (0.2126 * r + 0.7152 * g + 0.0722 * b) * c.yScale;
   cb = c.cOff + (-0.1146 * r - 0.3854 * g + 0.5000 * b) * c.cScale;
   cr = c.cOff + (0.5000 * r - 0.4542 * g - 0.0458 * b) * c.cScale;
@@ -108,7 +116,8 @@ inline int clampTo(double v, int lo, int hi) {
 void packUYVY(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
               long w, long h, DeckLinkVideoRange range) {
   const Coeffs c = coeffsFor(range);
-  const int lo = (range == DeckLinkVideoRangeFull) ? 0 : 1, hi = 255;
+  // Clamp in the 10-bit domain and shift down at the end: 64..940 >> 2 lands exactly on 16..235.
+  const int lo = (range == DeckLinkVideoRangeFull) ? 0 : 4, hi = 1019;
   for (long y = 0; y < h; y++) {
     const uint8_t *s = src + y * srcStride;
     uint8_t *d = dst + y * dstStride;
@@ -116,10 +125,10 @@ void packUYVY(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
       double y0, cb0, cr0, y1, cb1, cr1;
       bgraToYCbCr(s + x * 4, c, y0, cb0, cr0);
       bgraToYCbCr(s + (x + 1 < w ? x + 1 : x) * 4, c, y1, cb1, cr1);
-      d[x * 2 + 0] = uint8_t(clampTo((cb0 + cb1) / 2, lo, hi));
-      d[x * 2 + 1] = uint8_t(clampTo(y0, lo, hi));
-      d[x * 2 + 2] = uint8_t(clampTo((cr0 + cr1) / 2, lo, hi));
-      d[x * 2 + 3] = uint8_t(clampTo(y1, lo, hi));
+      d[x * 2 + 0] = uint8_t(clampTo((cb0 + cb1) / 2, lo, hi) >> 2);
+      d[x * 2 + 1] = uint8_t(clampTo(y0, lo, hi) >> 2);
+      d[x * 2 + 2] = uint8_t(clampTo((cr0 + cr1) / 2, lo, hi) >> 2);
+      d[x * 2 + 3] = uint8_t(clampTo(y1, lo, hi) >> 2);
     }
   }
 }
@@ -137,15 +146,14 @@ void packV210(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
   std::vector<int> Cr(size_t((w + 1) / 2), 0);
   for (long y = 0; y < h; y++) {
     const uint8_t *s = src + y * srcStride;
-    // Scale to 10 bits by multiplying the 8-bit-domain result by 4.
     for (long x = 0; x < w; x += 2) {
       double y0, cb0, cr0, y1, cb1, cr1;
       bgraToYCbCr(s + x * 4, c, y0, cb0, cr0);
       bgraToYCbCr(s + (x + 1 < w ? x + 1 : x) * 4, c, y1, cb1, cr1);
-      Y[size_t(x)] = clampTo(y0 * 4.0, lo, hi);
-      if (x + 1 < w) Y[size_t(x + 1)] = clampTo(y1 * 4.0, lo, hi);
-      Cb[size_t(x / 2)] = clampTo((cb0 + cb1) / 2 * 4.0, lo, hi);
-      Cr[size_t(x / 2)] = clampTo((cr0 + cr1) / 2 * 4.0, lo, hi);
+      Y[size_t(x)] = clampTo(y0, lo, hi);
+      if (x + 1 < w) Y[size_t(x + 1)] = clampTo(y1, lo, hi);
+      Cb[size_t(x / 2)] = clampTo((cb0 + cb1) / 2, lo, hi);
+      Cr[size_t(x / 2)] = clampTo((cr0 + cr1) / 2, lo, hi);
     }
     uint32_t *d = (uint32_t *)(dst + y * dstStride);
     long wi = 0;
@@ -169,14 +177,16 @@ void packR210(const uint8_t *src, long srcStride, uint8_t *dst, long dstStride,
     const uint8_t *s = src + y * srcStride;
     uint8_t *d = dst + y * dstStride;
     for (long x = 0; x < w; x++) {
-      const uint8_t *p = s + x * 4;
-      auto up = [&](uint8_t v) -> uint32_t {
-        // 8-bit full range in, 10-bit out; SMPTE compresses into 64..940.
-        double t = smpte ? (64.0 + double(v) * (940.0 - 64.0) / 255.0) : (double(v) * 1023.0 / 255.0);
-        int i = int(t + 0.5);
+      uint32_t px;
+      memcpy(&px, s + x * 4, sizeof(px));
+      auto up = [&](uint32_t v) -> uint32_t {
+        // 10-bit full range in; SMPTE compresses into 64..940, full range passes straight through.
+        if (!smpte) return v > 1023u ? 1023u : v;
+        int i = int(64.0 + double(v) * (940.0 - 64.0) / 1023.0 + 0.5);
         return uint32_t(i < 0 ? 0 : (i > 1023 ? 1023 : i));
       };
-      const uint32_t word = (up(p[2]) << 20) | (up(p[1]) << 10) | up(p[0]);  // BGRA -> R,G,B
+      const uint32_t b10 = px & 0x3ffu, g10 = (px >> 10) & 0x3ffu, r10 = (px >> 20) & 0x3ffu;
+      const uint32_t word = (up(r10) << 20) | (up(g10) << 10) | up(b10);
       d[x * 4 + 0] = uint8_t((word >> 24) & 0xff);
       d[x * 4 + 1] = uint8_t((word >> 16) & 0xff);
       d[x * 4 + 2] = uint8_t((word >> 8) & 0xff);
