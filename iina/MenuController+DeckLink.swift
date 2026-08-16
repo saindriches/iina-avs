@@ -281,6 +281,16 @@ extension MenuController {
                                           value: "PsF carries whole progressive frames in an interlaced raster, which is right for film and any progressive source. True Interlace samples each field a field period apart, which is what a CRT's scan shows, and needs motion at the field rate to be worth anything.",
                                           comment: "")
 
+    let twitter = menu.addItem(withTitle: NSLocalizedString("menu.decklink_interline",
+                                                             value: "Interline Filter", comment: ""),
+                               action: #selector(menuDeckLinkToggleInterlineFilter(_:)), keyEquivalent: "")
+    twitter.target = self
+    twitter.state = dl.interlineFilter ? .on : .off
+    twitter.isEnabled = dl.selectedMode?.isInterlacedOrPsF ?? false
+    twitter.toolTip = NSLocalizedString("menu.decklink_interline_tip",
+                                        value: "Band-limit vertically before the lines are split into fields. A CRT draws alternate lines in alternate fields, so single-line detail shimmers at the field rate; this trades some vertical resolution to stop it.",
+                                        comment: "")
+
     // -- latency strategy
     let lowLat = menu.addItem(withTitle: NSLocalizedString("menu.decklink_low_latency",
                                                            value: "Low Latency Mode",
@@ -345,6 +355,11 @@ extension MenuController {
     guard let raw = sender.representedObject as? Int,
           let mode = DeckLinkFieldMode(rawValue: raw) else { return }
     DeckLinkController.shared.setFieldMode(mode)
+  }
+
+  @objc func menuDeckLinkToggleInterlineFilter(_ sender: NSMenuItem) {
+    let dl = DeckLinkController.shared
+    dl.setInterlineFilter(!dl.interlineFilter)
   }
 
   @objc func menuDeckLinkToggle444(_ sender: NSMenuItem) {

@@ -26,6 +26,7 @@ private struct Keys {
   static let use444 = "decklink.use444SDI"
   static let levelA = "decklink.levelA"
   static let fieldMode = "decklink.fieldMode"
+  static let interlineFilter = "decklink.interlineFilter"
 }
 
 /// How the two fields of an interlaced frame are produced.
@@ -76,6 +77,11 @@ class DeckLinkController {
   /// modes. Defaults to PsF, which is what the output has always produced, so an existing setup is
   /// unchanged until this is asked for.
   private(set) var fieldMode: DeckLinkFieldMode
+
+  /// Vertical band-limit before lines are split into fields, against interline twitter on a CRT.
+  /// Costs vertical resolution, so it is off unless asked for, and it is only offered on an
+  /// interlaced raster.
+  private(set) var interlineFilter: Bool
 
   // MARK: - which player feeds the card
 
@@ -191,6 +197,7 @@ class DeckLinkController {
     use444 = d.bool(forKey: Keys.use444)
     levelA = d.bool(forKey: Keys.levelA)
     fieldMode = DeckLinkFieldMode(rawValue: d.object(forKey: Keys.fieldMode) as? Int ?? 0) ?? .psf
+    interlineFilter = d.bool(forKey: Keys.interlineFilter)
     updateActivityObservers()
     observeActivationForRestore()
     observeSleepWake()
@@ -283,6 +290,13 @@ class DeckLinkController {
     restartIfNeeded()
   }
 
+  func setInterlineFilter(_ on: Bool) {
+    guard on != interlineFilter else { return }
+    interlineFilter = on
+    UserDefaults.standard.set(on, forKey: Keys.interlineFilter)
+    restartIfNeeded()
+  }
+
   func setLevelA(_ on: Bool) {
     guard on != levelA else { return }
     levelA = on
@@ -332,8 +346,12 @@ class DeckLinkController {
     // Weave only when the raster is genuinely interlaced AND the user asked for it: PsF rasters are
     // one instant by definition, and a progressive mode must not be touched.
     let weave = mode.isInterlaced && fieldMode == .trueInterlace
+    // The filter is about an interlaced raster, PsF included, since a CRT scans alternate lines
+    // either way. A progressive mode has nothing to twitter, so it never gets it.
+    let filter = mode.isInterlacedOrPsF && interlineFilter
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
-                 weaveFields: weave, upperFieldFirst: mode.upperFieldFirst)
+                 weaveFields: weave, upperFieldFirst: mode.upperFieldFirst,
+                 interlineFilter: filter)
 
     var ok = false
     do {

@@ -33,6 +33,7 @@ class DeckLinkPanelController: NSWindowController {
   private var rangePopUp: NSPopUpButton!
   private var linkPopUp: NSPopUpButton!
   private var fieldPopUp: NSPopUpButton!
+  private var interlineBox: NSButton!
   private var use444Box: NSButton!
   private var levelABox: NSButton!
   private var nativeRenderBox: NSButton!
@@ -105,6 +106,10 @@ class DeckLinkPanelController: NSWindowController {
 
     fieldPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_fields", value: "Fields", comment: ""),
                         action: #selector(selectFieldMode(_:)))
+
+    interlineBox = addCheck(to: stack, NSLocalizedString("menu.decklink_interline",
+                                                         value: "Interline Filter", comment: ""),
+                            action: #selector(toggleInterlineFilter(_:)))
 
     stack.addArrangedSubview(separator())
 
@@ -316,6 +321,8 @@ class DeckLinkPanelController: NSWindowController {
       fieldPopUp.selectItem(at: index)
     }
     fieldPopUp.isEnabled = interlacedRaster
+    interlineBox.state = dl.interlineFilter ? .on : .off
+    interlineBox.isEnabled = dl.selectedMode?.isInterlacedOrPsF ?? false
 
     use444Box.state = dl.use444 ? .on : .off
     use444Box.isEnabled = caps?.supports444SDI ?? false
@@ -405,6 +412,11 @@ class DeckLinkPanelController: NSWindowController {
     guard let raw = sender.selectedItem?.representedObject as? Int,
           let mode = DeckLinkFieldMode(rawValue: raw) else { return }
     DeckLinkController.shared.setFieldMode(mode)
+    refresh()
+  }
+
+  @objc private func toggleInterlineFilter(_ sender: NSButton) {
+    DeckLinkController.shared.setInterlineFilter(sender.state == .on)
     refresh()
   }
 

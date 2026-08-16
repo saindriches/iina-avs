@@ -47,6 +47,15 @@ final class DeckLinkVideoTap {
   /// 0 = waiting for the earlier field, 1 = waiting for the later one.
   private var fieldParity = 0
 
+  /// Vertical low-pass before the lines are split into fields.
+  ///
+  /// A CRT draws alternate lines in alternate fields, so any detail that lives on a single line
+  /// appears at the field rate rather than the frame rate and shimmers: interline twitter, worst on
+  /// titles and hard horizontal edges. Broadcast practice band-limits vertically before interlacing,
+  /// which is what this does. It costs real vertical resolution, so it is opt-in and off by default,
+  /// and it never applies to a progressive raster where there is nothing to twitter.
+  private var interlineFilter = false
+
   private var fbo: GLuint = 0
   private var texture: GLuint = 0
   /// The GL context `fbo`/`texture`/`pbos` were created in. Handles are only meaningful there.
@@ -80,12 +89,14 @@ final class DeckLinkVideoTap {
   // MARK: - lifecycle
 
   func activate(width: Int, height: Int, fps: Double,
-                weaveFields: Bool = false, upperFieldFirst: Bool = true) {
+                weaveFields: Bool = false, upperFieldFirst: Bool = true,
+                interlineFilter: Bool = false) {
     lock.lock()
     targetWidth = width
     targetHeight = height
     self.weaveFields = weaveFields
     self.upperFieldFirst = upperFieldFirst
+    self.interlineFilter = interlineFilter
     fieldParity = 0
     // Sample at the FIELD rate when weaving, since each field is its own moment. `fps` is the frame
     // rate the card reports, so 1080i59.94 arrives here as 29.97 and must be captured at 59.94.
@@ -105,20 +116,55 @@ final class DeckLinkVideoTap {
     return (fieldParity == 0) == earlierIsEven ? 0 : 1
   }
 
+  /// Copy one row through a vertical [1 2 1]/4 filter of the source rows either side of it.
+  ///
+  /// Works directly on the packed 2:10:10:10 words. Each component is shifted down BEFORE being
+  /// added so the three terms can never carry out of their own 10-bit field, which is what makes
+  /// this a handful of integer ops per pixel instead of an unpack, three multiplies and a repack.
+  /// The two masks drop the bits that a shift walks across a field boundary. Alpha is discarded,
+  /// which is fine: nothing downstream reads it.
+  private func filteredRow(_ src: UnsafePointer<UInt32>, _ dst: UnsafeMutablePointer<UInt32>,
+                           width w: Int, y: Int, height h: Int) {
+    let m1: UInt32 = 0x1FF7_FDFF   // valid bits per field after >> 1
+    let m2: UInt32 = 0x0FF3_FCFF   // valid bits per field after >> 2
+    let above = (y > 0 ? y - 1 : y) * w
+    let below = (y + 1 < h ? y + 1 : y) * w
+    let here = y * w
+    for x in 0..<w {
+      let a = (src[above + x] >> 2) & m2
+      let b = (src[here + x] >> 1) & m1
+      let c = (src[below + x] >> 2) & m2
+      dst[x] = a &+ b &+ c
+    }
+  }
+
   /// Take a readback into the published buffer. Whole frame when progressive; every other line, and
   /// publish only on the second of a pair, when weaving. Caller holds `lock`.
   private func store(from src: UnsafeRawPointer, width w: Int, height h: Int) {
     let rowBytes = w * 4
     buffer.withUnsafeMutableBytes { raw in
-      guard let dst = raw.baseAddress else { return }
-      guard weaveFields else {
-        memcpy(dst, src, rowBytes * h)
+      guard let dstBase = raw.baseAddress else { return }
+      let srcWords = src.assumingMemoryBound(to: UInt32.self)
+      let dstWords = dstBase.assumingMemoryBound(to: UInt32.self)
+      // Rows this call is responsible for: every other one when weaving, all of them otherwise.
+      let first = weaveFields ? fieldStartRow() : 0
+      let step = weaveFields ? 2 : 1
+      guard interlineFilter else {
+        guard weaveFields else {
+          memcpy(dstBase, src, rowBytes * h)
+          return
+        }
+        var y = first
+        while y < h {
+          memcpy(dstBase.advanced(by: y * rowBytes), src.advanced(by: y * rowBytes), rowBytes)
+          y += 2
+        }
         return
       }
-      var y = fieldStartRow()
+      var y = first
       while y < h {
-        memcpy(dst.advanced(by: y * rowBytes), src.advanced(by: y * rowBytes), rowBytes)
-        y += 2
+        filteredRow(srcWords, dstWords.advanced(by: y * w), width: w, y: y, height: h)
+        y += step
       }
     }
     guard weaveFields else {
@@ -286,9 +332,10 @@ final class DeckLinkVideoTap {
       glBindBuffer(GLenum(GL_PIXEL_PACK_BUFFER), 0)   // straight to client memory, no PBO
       lock.lock()
       if buffer.count == w * h * 4 {
-        if weaveFields {
-          // Weaving keeps half of the previous field, so a readback straight into the published
-          // buffer would destroy the field we are about to pair with. Progressive skips this.
+        if weaveFields || interlineFilter {
+          // Anything that transforms the readback needs a separate source: weaving keeps half of the
+          // previous field, and the filter reads neighbouring rows, so writing into the published
+          // buffer as we go would consume data we still need. Untransformed output skips this.
           if scratch.count != w * h * 4 { scratch = [UInt8](repeating: 0, count: w * h * 4) }
           scratch.withUnsafeMutableBytes { raw in
             if let base = raw.baseAddress {
