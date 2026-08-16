@@ -25,11 +25,21 @@ class DeckLinkPanelController: NSWindowController {
 
   private var observer: NSObjectProtocol?
   private var statusTimer: Timer?
-  /// Sampled once a second so the panel can show a RATE. Cumulative counters cannot answer the only
+  /// Sampled once a second so the panel can show RATES. Cumulative counters cannot answer the only
   /// question that matters for interlace, which is whether captures are arriving fast enough.
+  ///
+  /// Three rates rather than one, because they fail for different reasons and the cure differs.
+  /// `draw` is how often the GL hook runs at all, `capture` how many of those we sampled, and
+  /// `frames` how many WHOLE frames reached the card. draw short of the target means the display
+  /// loop is the ceiling; capture short of draw means we are discarding samples; frames short of
+  /// half the captures means pairs are not completing and the feeder is repeating.
   private var lastCaptured = 0
+  private var lastPublished = 0
+  private var lastHookCalls = 0
   private var lastSampledAt: CFTimeInterval = 0
   private var capturesPerSecond: Double = 0
+  private var framesPerSecond: Double = 0
+  private var drawsPerSecond: Double = 0
 
   /// Rows whose enabled state depends on hardware capability, rebuilt on every refresh.
   private var devicePopUp: NSPopUpButton!
@@ -349,9 +359,14 @@ class DeckLinkPanelController: NSWindowController {
 
     let now = CACurrentMediaTime()
     if lastSampledAt > 0, now > lastSampledAt {
-      capturesPerSecond = Double(dl.capturedFrames - lastCaptured) / (now - lastSampledAt)
+      let elapsed = now - lastSampledAt
+      capturesPerSecond = Double(dl.capturedFrames - lastCaptured) / elapsed
+      framesPerSecond = Double(dl.publishedFrames - lastPublished) / elapsed
+      drawsPerSecond = Double(dl.hookCalls - lastHookCalls) / elapsed
     }
     lastCaptured = dl.capturedFrames
+    lastPublished = dl.publishedFrames
+    lastHookCalls = dl.hookCalls
     lastSampledAt = now
     if let error = dl.lastError {
       statusLabel.stringValue = error
@@ -381,9 +396,9 @@ class DeckLinkPanelController: NSWindowController {
                        raster, weaving ? "on" : "off")
         let needed = mode.fps * (weaving ? 2.0 : 1.0)
         text += String(format: NSLocalizedString("decklink.panel_rate",
-                                                 value: "\ncapture %.1f/s of %.2f needed",
-                                                 comment: "capture rate vs required"),
-                       capturesPerSecond, needed)
+                                                 value: "\ndraw %.1f/s, capture %.1f/s of %.2f needed\nframes out %.1f/s of %.2f",
+                                                 comment: "draw, capture and published frame rates"),
+                       drawsPerSecond, capturesPerSecond, needed, framesPerSecond, mode.fps)
       }
       statusLabel.stringValue = text
     } else if !dl.isDriverAvailable {

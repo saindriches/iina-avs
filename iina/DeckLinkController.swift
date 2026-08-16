@@ -173,6 +173,8 @@ class DeckLinkController {
   var resyncCount: Int { output.resyncCount }
   var repeatCount: Int { output.repeatCount }
   var capturedFrames: Int { tap.capturedFrames }
+  var publishedFrames: Int { tap.publishedFrames }
+  var hookCalls: Int { tap.hookCalls }
 
   private var wasRunningBeforeResign = false
   private var wasRunningBeforeSleep = false

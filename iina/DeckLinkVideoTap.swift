@@ -13,7 +13,7 @@
 //
 //  Threading: `capture` runs on IINA's GL thread (inside ViewLayer.draw, where the context is
 //  current). `copyLatest` runs on whichever worker thread the active output path owns. They meet
-//  only through `buffer` under `lock`, so no GL call ever happens off the GL thread.
+//  only through `published` under `lock`, so no GL call ever happens off the GL thread.
 //
 //  Limitation: capture is driven by the display refresh, not the card clock, so the two rates are
 //  reconciled by latest-frame-wins. Card-clocked rendering would need a shared GL context on a
@@ -76,16 +76,25 @@ final class DeckLinkVideoTap {
   var immediateReadback = false
 
   private let lock = NSLock()
-  /// Whether the most recent store finished a frame rather than leaving a seeded second field.
-  /// Always true when not weaving. The card should only be asked to display on a complete frame.
+  /// Whether the most recent store finished a frame. Always true when not weaving. The card should
+  /// only be asked to display on a complete frame.
   private(set) var frameComplete = true
-  private var buffer = [UInt8]()
-  /// Landing area for a readback, so weaving can merge into `buffer` without destroying the field
+  /// The frame being assembled. Weaving writes one field of it per capture, so between the two it is
+  /// half this pair and half the last one, and it must never be what the card reads.
+  private var working = [UInt8]()
+  /// The most recent WHOLE frame, and the only thing `copyLatest` hands out.
+  private var published = [UInt8]()
+  /// Landing area for a readback, so weaving can merge into `working` without destroying the field
   /// already sitting there.
   private var scratch = [UInt8]()
   private var hasFrame = false
 
   private(set) var capturedFrames = 0
+  /// Whole frames handed to the feeder. Below the mode's frame rate means the feeder is repeating.
+  private(set) var publishedFrames = 0
+  /// Times the GL hook was entered, counted before any rate gating. Against `capturedFrames` this
+  /// separates "the draw loop is not running often enough" from "we are discarding samples".
+  private(set) var hookCalls = 0
 
   var isActive: Bool { targetWidth > 0 && targetHeight > 0 }
 
@@ -105,9 +114,13 @@ final class DeckLinkVideoTap {
     // rate the card reports, so 1080i59.94 arrives here as 29.97 and must be captured at 59.94.
     let sampleRate = weaveFields ? fps * 2.0 : fps
     minInterval = sampleRate > 0 ? (1.0 / sampleRate) * 0.9 : 0   // 0.9 so jitter never starves the card
-    buffer = [UInt8](repeating: 0, count: width * height * 4)
+    working = [UInt8](repeating: 0, count: width * height * 4)
+    published = [UInt8](repeating: 0, count: width * height * 4)
     hasFrame = false
+    frameComplete = !weaveFields
     capturedFrames = 0
+    publishedFrames = 0
+    hookCalls = 0
     lastCaptureAt = 0
     lock.unlock()
   }
@@ -141,20 +154,23 @@ final class DeckLinkVideoTap {
     }
   }
 
-  /// Take a readback into the published buffer, then publish it.
+  /// Take a readback into the working frame, and publish it once it is whole.
   ///
-  /// Progressive copies the whole frame. Weaving writes the rows of the field this sample belongs
-  /// to, and when it is the first of a pair it seeds the other field from the same sample as well,
-  /// so what the card can pick up is always a complete, current frame. Publishing only on a
-  /// completed pair meant the card re-sent the previous frame whenever the second sample was late
-  /// or never came, which showed up as dropped fields. A second sample overwrites the seed and the
-  /// frame becomes a true pair; without one it degrades to PsF, which is the honest answer when the
-  /// source carries no motion at the field rate.
+  /// Progressive copies the whole frame and publishes it immediately. Weaving writes only the rows
+  /// of the field this sample belongs to and publishes when the second field of the pair lands, so
+  /// the feeder can never pick up a frame that is half this pair and half the last one.
+  ///
+  /// An earlier version seeded the missing field from the same sample, to guarantee the feeder
+  /// always had something current. That is wrong for a feeder running on its own clock: it samples
+  /// between the two fields as often as not, and a seeded frame is a PsF frame, so the output
+  /// alternated between true field pairs and frozen ones. Repeating the last WHOLE frame is the
+  /// honest failure: it costs judder when we cannot keep up, rather than corrupting the motion of
+  /// frames we could.
   ///
   /// Caller holds `lock`.
   private func store(from src: UnsafeRawPointer, width w: Int, height h: Int) {
     let rowBytes = w * 4
-    buffer.withUnsafeMutableBytes { raw in
+    working.withUnsafeMutableBytes { raw in
       guard let dstBase = raw.baseAddress else { return }
       let srcWords = src.assumingMemoryBound(to: UInt32.self)
       let dstWords = dstBase.assumingMemoryBound(to: UInt32.self)
@@ -177,21 +193,23 @@ final class DeckLinkVideoTap {
         return
       }
 
+      // Only this field's rows. The other half of `working` still holds the frame published two
+      // pairs ago and is overwritten by this pair's second sample before anything sees it.
       let first = fieldStartRow()
       var y = first
       while y < h { copyRow(y); y += 2 }
-      if fieldParity == 0 {   // seed the other field so the frame is never half stale
-        var o = first == 0 ? 1 : 0
-        while o < h { copyRow(o); o += 2 }
-      }
     }
     if weaveFields { fieldParity ^= 1 }
-    // Parity back at 0 means the second field of the pair has just landed. While it is 1 the frame
-    // still carries the seed, and showing it then is what made the card alternate between a true
-    // pair and a half-built one.
+    // Parity back at 0 means the second field of the pair has just landed.
     frameComplete = !weaveFields || fieldParity == 0
-    hasFrame = true
     capturedFrames += 1
+    guard frameComplete else { return }
+
+    // O(1): an Array is one reference to its storage, so this hands the feeder the frame just
+    // finished and takes back the one it had, to assemble the next pair in.
+    swap(&working, &published)
+    hasFrame = true
+    publishedFrames += 1
   }
 
   /// GL teardown has to happen on the GL thread, so this only marks the tap inactive; the FBO is
@@ -240,6 +258,7 @@ final class DeckLinkVideoTap {
     let w = targetWidth, h = targetHeight, interval = minInterval
     lock.unlock()
     guard w > 0, h > 0 else { return }
+    hookCalls += 1
 
     let now = CACurrentMediaTime()
     guard now - lastCaptureAt >= interval else { return }
@@ -282,6 +301,7 @@ final class DeckLinkVideoTap {
     let w = targetWidth, h = targetHeight
     lock.unlock()
     guard w > 0, h > 0, ensureFramebuffer(width: w, height: h) else { return false }
+    hookCalls += 1
 
     var prevViewport: [GLint] = [0, 0, 0, 0]
     glGetIntegerv(GLenum(GL_VIEWPORT), &prevViewport)
@@ -346,7 +366,7 @@ final class DeckLinkVideoTap {
     if immediateReadback {
       glBindBuffer(GLenum(GL_PIXEL_PACK_BUFFER), 0)   // straight to client memory, no PBO
       lock.lock()
-      if buffer.count == w * h * 4 {
+      if published.count == w * h * 4 {
         if weaveFields || interlineFilter {
           // Anything that transforms the readback needs a separate source: weaving keeps half of the
           // previous field, and the filter reads neighbouring rows, so writing into the published
@@ -360,7 +380,8 @@ final class DeckLinkVideoTap {
             }
           }
         } else {
-          buffer.withUnsafeMutableBytes { raw in
+          // Nothing to assemble, so read straight into the published frame and skip the copy.
+          published.withUnsafeMutableBytes { raw in
             if let base = raw.baseAddress {
               glReadPixels(0, 0, GLsizei(w), GLsizei(h), GLenum(GL_BGRA),
                            GLenum(GL_UNSIGNED_INT_2_10_10_10_REV), base)
@@ -368,6 +389,7 @@ final class DeckLinkVideoTap {
           }
           hasFrame = true
           capturedFrames += 1
+          publishedFrames += 1
         }
       }
       lock.unlock()
@@ -389,7 +411,7 @@ final class DeckLinkVideoTap {
       glBindBuffer(GLenum(GL_PIXEL_PACK_BUFFER), pbos[readIndex])
       if let mapped = glMapBuffer(GLenum(GL_PIXEL_PACK_BUFFER), GLenum(GL_READ_ONLY)) {
         lock.lock()
-        if buffer.count == byteCount {   // guard a deactivate() that landed mid-render
+        if working.count == byteCount {   // guard a deactivate() that landed mid-render
           store(from: mapped, width: w, height: h)
         }
         lock.unlock()
@@ -482,9 +504,9 @@ final class DeckLinkVideoTap {
     lock.lock()
     defer { lock.unlock() }
     guard hasFrame, width == targetWidth, height == targetHeight,
-          buffer.count == width * height * 4 else { return false }
+          published.count == width * height * 4 else { return false }
     let rowBytes = width * 4
-    buffer.withUnsafeBytes { raw in
+    published.withUnsafeBytes { raw in
       guard let base = raw.baseAddress else { return }
       if stride == rowBytes {
         memcpy(destination, base, rowBytes * height)
