@@ -342,10 +342,15 @@ class DeckLinkController {
     // The tap must be live before the device opens: preroll asks the provider for frames straight
     // away, and an inactive tap fails copyLatest's size guard. Preroll would then schedule nothing,
     // and a feeder driven by completion callbacks cannot start from an empty queue.
-    tap.immediateReadback = lowLatency   // sub-frame monitoring wants this frame, not the last one
     // Weave only when the raster is genuinely interlaced AND the user asked for it: PsF rasters are
     // one instant by definition, and a progressive mode must not be touched.
     let weave = mode.isInterlaced && fieldMode == .trueInterlace
+    // Immediate readback is synchronous, so it stalls the GL thread until the GPU is done. Weaving
+    // already needs twice as many readbacks, and at field rate that stall is what stops the pair
+    // completing in time, which the card then shows as a dropped field. Low Latency keeps its
+    // immediate DISPLAY either way; only the readback falls back to the pipelined path, at the cost
+    // of one field of delay that monitoring will never notice.
+    tap.immediateReadback = lowLatency && !weave   // sub-frame monitoring wants this frame, not the last one
     // The filter is about an interlaced raster, PsF included, since a CRT scans alternate lines
     // either way. A progressive mode has nothing to twitter, so it never gets it.
     let filter = mode.isInterlacedOrPsF && interlineFilter

@@ -138,45 +138,53 @@ final class DeckLinkVideoTap {
     }
   }
 
-  /// Take a readback into the published buffer. Whole frame when progressive; every other line, and
-  /// publish only on the second of a pair, when weaving. Caller holds `lock`.
+  /// Take a readback into the published buffer, then publish it.
+  ///
+  /// Progressive copies the whole frame. Weaving writes the rows of the field this sample belongs
+  /// to, and when it is the first of a pair it seeds the other field from the same sample as well,
+  /// so what the card can pick up is always a complete, current frame. Publishing only on a
+  /// completed pair meant the card re-sent the previous frame whenever the second sample was late
+  /// or never came, which showed up as dropped fields. A second sample overwrites the seed and the
+  /// frame becomes a true pair; without one it degrades to PsF, which is the honest answer when the
+  /// source carries no motion at the field rate.
+  ///
+  /// Caller holds `lock`.
   private func store(from src: UnsafeRawPointer, width w: Int, height h: Int) {
     let rowBytes = w * 4
     buffer.withUnsafeMutableBytes { raw in
       guard let dstBase = raw.baseAddress else { return }
       let srcWords = src.assumingMemoryBound(to: UInt32.self)
       let dstWords = dstBase.assumingMemoryBound(to: UInt32.self)
-      // Rows this call is responsible for: every other one when weaving, all of them otherwise.
-      let first = weaveFields ? fieldStartRow() : 0
-      let step = weaveFields ? 2 : 1
-      guard interlineFilter else {
-        guard weaveFields else {
-          memcpy(dstBase, src, rowBytes * h)
-          return
-        }
-        var y = first
-        while y < h {
+
+      // One row, through the filter or straight across.
+      func copyRow(_ y: Int) {
+        if interlineFilter {
+          filteredRow(srcWords, dstWords.advanced(by: y * w), width: w, y: y, height: h)
+        } else {
           memcpy(dstBase.advanced(by: y * rowBytes), src.advanced(by: y * rowBytes), rowBytes)
-          y += 2
+        }
+      }
+
+      guard weaveFields else {
+        if interlineFilter {
+          for y in 0..<h { copyRow(y) }
+        } else {
+          memcpy(dstBase, src, rowBytes * h)   // untouched fast path
         }
         return
       }
+
+      let first = fieldStartRow()
       var y = first
-      while y < h {
-        filteredRow(srcWords, dstWords.advanced(by: y * w), width: w, y: y, height: h)
-        y += step
+      while y < h { copyRow(y); y += 2 }
+      if fieldParity == 0 {   // seed the other field so the frame is never half stale
+        var o = first == 0 ? 1 : 0
+        while o < h { copyRow(o); o += 2 }
       }
     }
-    guard weaveFields else {
-      hasFrame = true
-      capturedFrames += 1
-      return
-    }
-    fieldParity ^= 1
-    if fieldParity == 0 {   // the pair is complete, so the frame is now two distinct moments
-      hasFrame = true
-      capturedFrames += 1
-    }
+    if weaveFields { fieldParity ^= 1 }
+    hasFrame = true
+    capturedFrames += 1
   }
 
   /// GL teardown has to happen on the GL thread, so this only marks the tap inactive; the FBO is
