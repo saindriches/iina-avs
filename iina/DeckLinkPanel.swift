@@ -25,6 +25,11 @@ class DeckLinkPanelController: NSWindowController {
 
   private var observer: NSObjectProtocol?
   private var statusTimer: Timer?
+  /// Sampled once a second so the panel can show a RATE. Cumulative counters cannot answer the only
+  /// question that matters for interlace, which is whether captures are arriving fast enough.
+  private var lastCaptured = 0
+  private var lastSampledAt: CFTimeInterval = 0
+  private var capturesPerSecond: Double = 0
 
   /// Rows whose enabled state depends on hardware capability, rebuilt on every refresh.
   private var devicePopUp: NSPopUpButton!
@@ -341,12 +346,30 @@ class DeckLinkPanelController: NSWindowController {
   private func refreshStatus() {
     guard window?.isVisible == true, statusLabel != nil else { return }
     let dl = DeckLinkController.shared
+
+    let now = CACurrentMediaTime()
+    if lastSampledAt > 0, now > lastSampledAt {
+      capturesPerSecond = Double(dl.capturedFrames - lastCaptured) / (now - lastSampledAt)
+    }
+    lastCaptured = dl.capturedFrames
+    lastSampledAt = now
     if let error = dl.lastError {
       statusLabel.stringValue = error
     } else if dl.isRunning {
-      statusLabel.stringValue = String(format: NSLocalizedString("menu.decklink_status", value: "Scheduled %ld, late %ld, dropped %ld, captured %ld, resync %ld, repeat %ld", comment: ""),
-                                       dl.scheduledFrames, dl.lateFrames, dl.droppedFrames,
-                                       dl.capturedFrames, dl.resyncCount, dl.repeatCount)
+      var text = String(format: NSLocalizedString("menu.decklink_status", value: "Scheduled %ld, late %ld, dropped %ld, captured %ld, resync %ld, repeat %ld", comment: ""),
+                        dl.scheduledFrames, dl.lateFrames, dl.droppedFrames,
+                        dl.capturedFrames, dl.resyncCount, dl.repeatCount)
+      // The rate, and what it has to be. Interlace weaving needs a sample per FIELD, so the target
+      // is twice the mode's frame rate; anything short of it means frames go out as PsF seeds
+      // rather than as two distinct moments.
+      if let mode = dl.selectedMode {
+        let needed = mode.fps * (dl.fieldMode == .trueInterlace && mode.isInterlaced ? 2.0 : 1.0)
+        text += String(format: NSLocalizedString("decklink.panel_rate",
+                                                 value: "\ncapture %.1f/s of %.2f needed",
+                                                 comment: "capture rate vs required"),
+                       capturesPerSecond, needed)
+      }
+      statusLabel.stringValue = text
     } else if !dl.isDriverAvailable {
       statusLabel.stringValue = NSLocalizedString("menu.decklink_no_driver",
                                                   value: "Blackmagic Desktop Video not installed",
