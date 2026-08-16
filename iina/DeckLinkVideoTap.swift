@@ -34,6 +34,19 @@ final class DeckLinkVideoTap {
   private var minInterval: CFTimeInterval = 0
   private var lastCaptureAt: CFTimeInterval = 0
 
+  /// True interlace: the two fields of a frame must be DIFFERENT moments, 1/fieldRate apart, which
+  /// is what a CRT's scan actually shows. PsF is the other case and needs none of this, because both
+  /// its fields are one instant by definition.
+  ///
+  /// So when this is on we sample at the FIELD rate and keep alternate lines of each sample, then
+  /// publish once a pair is complete. Line-dropping is the correct spatial sampling here: even lines
+  /// are exactly where the first field's scan sits, odd lines the second's.
+  private var weaveFields = false
+  /// Which field is transmitted first, and so carries the earlier sample.
+  private var upperFieldFirst = true
+  /// 0 = waiting for the earlier field, 1 = waiting for the later one.
+  private var fieldParity = 0
+
   private var fbo: GLuint = 0
   private var texture: GLuint = 0
   /// The GL context `fbo`/`texture`/`pbos` were created in. Handles are only meaningful there.
@@ -55,6 +68,9 @@ final class DeckLinkVideoTap {
 
   private let lock = NSLock()
   private var buffer = [UInt8]()
+  /// Landing area for a readback, so weaving can merge into `buffer` without destroying the field
+  /// already sitting there.
+  private var scratch = [UInt8]()
   private var hasFrame = false
 
   private(set) var capturedFrames = 0
@@ -63,16 +79,58 @@ final class DeckLinkVideoTap {
 
   // MARK: - lifecycle
 
-  func activate(width: Int, height: Int, fps: Double) {
+  func activate(width: Int, height: Int, fps: Double,
+                weaveFields: Bool = false, upperFieldFirst: Bool = true) {
     lock.lock()
     targetWidth = width
     targetHeight = height
-    minInterval = fps > 0 ? (1.0 / fps) * 0.9 : 0   // 0.9 so jitter never starves the card
+    self.weaveFields = weaveFields
+    self.upperFieldFirst = upperFieldFirst
+    fieldParity = 0
+    // Sample at the FIELD rate when weaving, since each field is its own moment. `fps` is the frame
+    // rate the card reports, so 1080i59.94 arrives here as 29.97 and must be captured at 59.94.
+    let sampleRate = weaveFields ? fps * 2.0 : fps
+    minInterval = sampleRate > 0 ? (1.0 / sampleRate) * 0.9 : 0   // 0.9 so jitter never starves the card
     buffer = [UInt8](repeating: 0, count: width * height * 4)
     hasFrame = false
     capturedFrames = 0
     lastCaptureAt = 0
     lock.unlock()
+  }
+
+  /// Row the current field starts on. The earlier sample has to land in the field the card transmits
+  /// first, or the two moments come out in the wrong order and motion tears backwards.
+  private func fieldStartRow() -> Int {
+    let earlierIsEven = upperFieldFirst
+    return (fieldParity == 0) == earlierIsEven ? 0 : 1
+  }
+
+  /// Take a readback into the published buffer. Whole frame when progressive; every other line, and
+  /// publish only on the second of a pair, when weaving. Caller holds `lock`.
+  private func store(from src: UnsafeRawPointer, width w: Int, height h: Int) {
+    let rowBytes = w * 4
+    buffer.withUnsafeMutableBytes { raw in
+      guard let dst = raw.baseAddress else { return }
+      guard weaveFields else {
+        memcpy(dst, src, rowBytes * h)
+        return
+      }
+      var y = fieldStartRow()
+      while y < h {
+        memcpy(dst.advanced(by: y * rowBytes), src.advanced(by: y * rowBytes), rowBytes)
+        y += 2
+      }
+    }
+    guard weaveFields else {
+      hasFrame = true
+      capturedFrames += 1
+      return
+    }
+    fieldParity ^= 1
+    if fieldParity == 0 {   // the pair is complete, so the frame is now two distinct moments
+      hasFrame = true
+      capturedFrames += 1
+    }
   }
 
   /// GL teardown has to happen on the GL thread, so this only marks the tap inactive; the FBO is
@@ -191,7 +249,16 @@ final class DeckLinkVideoTap {
       }
     }
 
-    readBackCurrentFBO(width: w, height: h)
+    // Field spacing has to match the card's, or the two moments woven into a frame are however far
+    // apart the display happened to refresh. Only gates the readback: the window still draws every
+    // time, and progressive output is unaffected because `minInterval` gating stays off for it.
+    var takeIt = true
+    if weaveFields {
+      let now = CACurrentMediaTime()
+      takeIt = now - lastCaptureAt >= minInterval
+      if takeIt { lastCaptureAt = now }
+    }
+    if takeIt { readBackCurrentFBO(width: w, height: h) }
 
     // Preview to the window from the same render. Y is inverted here because the SDI render is
     // unflipped and the screen expects the on-screen orientation.
@@ -219,14 +286,27 @@ final class DeckLinkVideoTap {
       glBindBuffer(GLenum(GL_PIXEL_PACK_BUFFER), 0)   // straight to client memory, no PBO
       lock.lock()
       if buffer.count == w * h * 4 {
-        buffer.withUnsafeMutableBytes { raw in
-          if let base = raw.baseAddress {
-            glReadPixels(0, 0, GLsizei(w), GLsizei(h), GLenum(GL_BGRA),
-                         GLenum(GL_UNSIGNED_INT_2_10_10_10_REV), base)
+        if weaveFields {
+          // Weaving keeps half of the previous field, so a readback straight into the published
+          // buffer would destroy the field we are about to pair with. Progressive skips this.
+          if scratch.count != w * h * 4 { scratch = [UInt8](repeating: 0, count: w * h * 4) }
+          scratch.withUnsafeMutableBytes { raw in
+            if let base = raw.baseAddress {
+              glReadPixels(0, 0, GLsizei(w), GLsizei(h), GLenum(GL_BGRA),
+                           GLenum(GL_UNSIGNED_INT_2_10_10_10_REV), base)
+              store(from: base, width: w, height: h)
+            }
           }
+        } else {
+          buffer.withUnsafeMutableBytes { raw in
+            if let base = raw.baseAddress {
+              glReadPixels(0, 0, GLsizei(w), GLsizei(h), GLenum(GL_BGRA),
+                           GLenum(GL_UNSIGNED_INT_2_10_10_10_REV), base)
+            }
+          }
+          hasFrame = true
+          capturedFrames += 1
         }
-        hasFrame = true
-        capturedFrames += 1
       }
       lock.unlock()
       return
@@ -248,11 +328,7 @@ final class DeckLinkVideoTap {
       if let mapped = glMapBuffer(GLenum(GL_PIXEL_PACK_BUFFER), GLenum(GL_READ_ONLY)) {
         lock.lock()
         if buffer.count == byteCount {   // guard a deactivate() that landed mid-render
-          buffer.withUnsafeMutableBytes { raw in
-            if let base = raw.baseAddress { memcpy(base, mapped, byteCount) }
-          }
-          hasFrame = true
-          capturedFrames += 1
+          store(from: mapped, width: w, height: h)
         }
         lock.unlock()
         glUnmapBuffer(GLenum(GL_PIXEL_PACK_BUFFER))

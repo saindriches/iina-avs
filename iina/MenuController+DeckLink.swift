@@ -253,6 +253,34 @@ extension MenuController {
                                            value: "SMPTE Level A signalling for 3G-SDI. Level B is the default and more widely accepted; some monitors and routers require A.",
                                            comment: "")
 
+    // -- field mode, only meaningful on an interlaced raster. PsF rasters and progressive modes have
+    // nothing to choose, so the row is offered but disabled rather than silently ignored.
+    let interlacedRaster = dl.selectedMode?.isInterlaced ?? false
+    let fieldMenu = NSMenu()
+    fieldMenu.autoenablesItems = false
+    let fieldModes: [(DeckLinkFieldMode, String)] = [
+      (.psf, NSLocalizedString("menu.decklink_field_psf", value: "PsF (whole frames)", comment: "")),
+      (.trueInterlace, NSLocalizedString("menu.decklink_field_true", value: "True Interlace (field-rate)", comment: "")),
+    ]
+    for (value, title) in fieldModes {
+      let item = fieldMenu.addItem(withTitle: title,
+                                   action: #selector(menuDeckLinkSelectFieldMode(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = value.rawValue
+      item.state = (value == dl.fieldMode) ? .on : .off
+      item.isEnabled = interlacedRaster
+    }
+    let fieldName = fieldModes.first { $0.0 == dl.fieldMode }?.1 ?? "-"
+    let fieldItem = menu.addItem(withTitle: String(format: "%@:  %@",
+                                                   NSLocalizedString("menu.decklink_fields", value: "Fields", comment: ""),
+                                                   fieldName),
+                                 action: nil, keyEquivalent: "")
+    fieldItem.submenu = fieldMenu
+    fieldItem.isEnabled = interlacedRaster
+    fieldItem.toolTip = NSLocalizedString("menu.decklink_fields_tip",
+                                          value: "PsF carries whole progressive frames in an interlaced raster, which is right for film and any progressive source. True Interlace samples each field a field period apart, which is what a CRT's scan shows, and needs motion at the field rate to be worth anything.",
+                                          comment: "")
+
     // -- latency strategy
     let lowLat = menu.addItem(withTitle: NSLocalizedString("menu.decklink_low_latency",
                                                            value: "Low Latency Mode",
@@ -311,6 +339,12 @@ extension MenuController {
     guard let raw = sender.representedObject as? Int,
           let link = DeckLinkSDILink(rawValue: raw) else { return }
     DeckLinkController.shared.selectSDILink(link)
+  }
+
+  @objc func menuDeckLinkSelectFieldMode(_ sender: NSMenuItem) {
+    guard let raw = sender.representedObject as? Int,
+          let mode = DeckLinkFieldMode(rawValue: raw) else { return }
+    DeckLinkController.shared.setFieldMode(mode)
   }
 
   @objc func menuDeckLinkToggle444(_ sender: NSMenuItem) {

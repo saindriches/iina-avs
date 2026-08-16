@@ -25,6 +25,17 @@ private struct Keys {
   static let sdiLink = "decklink.sdiLink"
   static let use444 = "decklink.use444SDI"
   static let levelA = "decklink.levelA"
+  static let fieldMode = "decklink.fieldMode"
+}
+
+/// How the two fields of an interlaced frame are produced.
+enum DeckLinkFieldMode: Int {
+  /// Both fields are one instant: a progressive frame carried in an interlaced raster. Right for
+  /// film and any progressive source, and what this output has always produced.
+  case psf = 0
+  /// Each field is its own moment, a field period apart, which is what a CRT's scan actually shows.
+  /// Only buys anything when the source itself carries motion at the field rate.
+  case trueInterlace = 1
 }
 
 class DeckLinkController {
@@ -60,6 +71,11 @@ class DeckLinkController {
   /// SMPTE Level A signalling for 3G-SDI. Level B is the default and more widely accepted; some
   /// monitors and routers want A.
   private(set) var levelA: Bool
+
+  /// PsF or genuinely interlaced fields, for modes with an interlaced raster. Ignored by progressive
+  /// modes. Defaults to PsF, which is what the output has always produced, so an existing setup is
+  /// unchanged until this is asked for.
+  private(set) var fieldMode: DeckLinkFieldMode
 
   // MARK: - which player feeds the card
 
@@ -174,6 +190,7 @@ class DeckLinkController {
     sdiLink = DeckLinkSDILink(rawValue: d.object(forKey: Keys.sdiLink) as? Int ?? 0) ?? .single
     use444 = d.bool(forKey: Keys.use444)
     levelA = d.bool(forKey: Keys.levelA)
+    fieldMode = DeckLinkFieldMode(rawValue: d.object(forKey: Keys.fieldMode) as? Int ?? 0) ?? .psf
     updateActivityObservers()
     observeActivationForRestore()
     observeSleepWake()
@@ -259,6 +276,13 @@ class DeckLinkController {
     restartIfNeeded()
   }
 
+  func setFieldMode(_ mode: DeckLinkFieldMode) {
+    guard mode != fieldMode else { return }
+    fieldMode = mode
+    UserDefaults.standard.set(mode.rawValue, forKey: Keys.fieldMode)
+    restartIfNeeded()
+  }
+
   func setLevelA(_ on: Bool) {
     guard on != levelA else { return }
     levelA = on
@@ -305,7 +329,11 @@ class DeckLinkController {
     // away, and an inactive tap fails copyLatest's size guard. Preroll would then schedule nothing,
     // and a feeder driven by completion callbacks cannot start from an empty queue.
     tap.immediateReadback = lowLatency   // sub-frame monitoring wants this frame, not the last one
-    tap.activate(width: mode.width, height: mode.height, fps: mode.fps)
+    // Weave only when the raster is genuinely interlaced AND the user asked for it: PsF rasters are
+    // one instant by definition, and a progressive mode must not be touched.
+    let weave = mode.isInterlaced && fieldMode == .trueInterlace
+    tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
+                 weaveFields: weave, upperFieldFirst: mode.upperFieldFirst)
 
     var ok = false
     do {

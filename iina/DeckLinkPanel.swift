@@ -32,6 +32,7 @@ class DeckLinkPanelController: NSWindowController {
   private var formatPopUp: NSPopUpButton!
   private var rangePopUp: NSPopUpButton!
   private var linkPopUp: NSPopUpButton!
+  private var fieldPopUp: NSPopUpButton!
   private var use444Box: NSButton!
   private var levelABox: NSButton!
   private var nativeRenderBox: NSButton!
@@ -101,6 +102,9 @@ class DeckLinkPanelController: NSWindowController {
                          action: #selector(toggle444(_:)))
     levelABox = addCheck(to: stack, NSLocalizedString("menu.decklink_level_a", value: "Level A for 3G-SDI", comment: ""),
                          action: #selector(toggleLevelA(_:)))
+
+    fieldPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_fields", value: "Fields", comment: ""),
+                        action: #selector(selectFieldMode(_:)))
 
     stack.addArrangedSubview(separator())
 
@@ -297,6 +301,22 @@ class DeckLinkPanelController: NSWindowController {
       linkPopUp.selectItem(at: index)
     }
 
+    // Fields: only an interlaced raster has a choice to make here.
+    let interlacedRaster = dl.selectedMode?.isInterlaced ?? false
+    let fieldModes: [(DeckLinkFieldMode, String)] = [
+      (.psf, NSLocalizedString("menu.decklink_field_psf", value: "PsF (whole frames)", comment: "")),
+      (.trueInterlace, NSLocalizedString("menu.decklink_field_true", value: "True Interlace (field-rate)", comment: "")),
+    ]
+    fieldPopUp.removeAllItems()
+    for (value, title) in fieldModes {
+      fieldPopUp.addItem(withTitle: title)
+      fieldPopUp.lastItem?.representedObject = value.rawValue
+    }
+    if let index = fieldModes.firstIndex(where: { $0.0 == dl.fieldMode }) {
+      fieldPopUp.selectItem(at: index)
+    }
+    fieldPopUp.isEnabled = interlacedRaster
+
     use444Box.state = dl.use444 ? .on : .off
     use444Box.isEnabled = caps?.supports444SDI ?? false
     levelABox.state = dl.levelA ? .on : .off
@@ -378,6 +398,13 @@ class DeckLinkPanelController: NSWindowController {
     guard let raw = sender.selectedItem?.representedObject as? Int,
           let link = DeckLinkSDILink(rawValue: raw) else { return }
     DeckLinkController.shared.selectSDILink(link)
+    refresh()
+  }
+
+  @objc private func selectFieldMode(_ sender: NSPopUpButton) {
+    guard let raw = sender.selectedItem?.representedObject as? Int,
+          let mode = DeckLinkFieldMode(rawValue: raw) else { return }
+    DeckLinkController.shared.setFieldMode(mode)
     refresh()
   }
 

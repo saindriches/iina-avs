@@ -259,10 +259,12 @@ static BOOL DLSupports444(IDeckLink *dl) {
 @implementation DeckLinkMode
 - (instancetype)initWithIndex:(NSInteger)i name:(NSString *)n width:(NSInteger)w height:(NSInteger)h
                           fps:(double)fps interlaced:(BOOL)il
+                    trueInterlaced:(BOOL)tif upperFieldFirst:(BOOL)uff
                          yuv8:(BOOL)y8 yuv10:(BOOL)y10 rgb10:(BOOL)r10 {
   if ((self = [super init])) {
     _index = i; _name = [n copy]; _width = w; _height = h; _fps = fps;
-    _isInterlacedOrPsF = il; _supports8BitYUV = y8; _supports10BitYUV = y10; _supports10BitRGB = r10;
+    _isInterlacedOrPsF = il; _isInterlaced = tif; _upperFieldFirst = uff;
+    _supports8BitYUV = y8; _supports10BitYUV = y10; _supports10BitRGB = r10;
   }
   return self;
 }
@@ -620,6 +622,10 @@ private:
       const BMDFieldDominance fd = m->GetFieldDominance();
       const BOOL interlaced = (fd == bmdLowerFieldFirst || fd == bmdUpperFieldFirst ||
                                fd == bmdProgressiveSegmentedFrame);
+      // PsF is excluded here: it is a progressive frame in an interlaced raster, so both its fields
+      // are the same instant by definition. Only these two want field-rate temporal sampling.
+      const BOOL trueInterlaced = (fd == bmdLowerFieldFirst || fd == bmdUpperFieldFirst);
+      const BOOL upperFieldFirst = (fd == bmdUpperFieldFirst);
       // Ask the driver rather than assuming; support genuinely varies by mode (for example
       // 10-bit RGB is unavailable on the 50/60p UHD modes for bandwidth reasons).
       BOOL y8 = NO, y10 = NO, r10 = NO;
@@ -643,6 +649,8 @@ private:
                                                      height:m->GetHeight()
                                                         fps:(dur ? double(ts) / double(dur) : 0.0)
                                                  interlaced:interlaced
+                                             trueInterlaced:trueInterlaced
+                                            upperFieldFirst:upperFieldFirst
                                                        yuv8:y8 yuv10:y10 rgb10:r10]];
       m->Release();
       i++;

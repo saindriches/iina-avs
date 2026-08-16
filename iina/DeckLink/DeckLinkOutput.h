@@ -61,6 +61,12 @@ typedef NS_ENUM(NSInteger, DeckLinkVideoRange) {
 /// True when the mode is transmitted as interlaced or PsF rather than progressive. A CRT master
 /// monitor on single-link HD-SDI generally wants one of these.
 @property (nonatomic, readonly) BOOL isInterlacedOrPsF;
+/// True only for a genuinely interlaced raster (upper or lower field first), false for PsF. PsF
+/// carries whole progressive frames in an interlaced raster; a truly interlaced mode expects each
+/// field to be a distinct moment in time.
+@property (nonatomic, readonly) BOOL isInterlaced;
+/// Which field is transmitted first, and therefore which one carries the EARLIER time sample.
+@property (nonatomic, readonly) BOOL upperFieldFirst;
 @property (nonatomic, readonly) BOOL supports8BitYUV;
 @property (nonatomic, readonly) BOOL supports10BitYUV;
 @property (nonatomic, readonly) BOOL supports10BitRGB;
