@@ -363,7 +363,23 @@ class DeckLinkPanelController: NSWindowController {
       // is twice the mode's frame rate; anything short of it means frames go out as PsF seeds
       // rather than as two distinct moments.
       if let mode = dl.selectedMode {
-        let needed = mode.fps * (dl.fieldMode == .trueInterlace && mode.isInterlaced ? 2.0 : 1.0)
+        // Say what the raster actually is and whether weaving armed. `isInterlaced` comes from the
+        // driver's field dominance, and if it does not report upper or lower first then weaving
+        // never engages however the Fields row is set, which looks identical to being too slow.
+        let raster: String
+        if mode.isInterlaced {
+          raster = mode.upperFieldFirst ? "interlaced, upper first" : "interlaced, lower first"
+        } else if mode.isInterlacedOrPsF {
+          raster = "PsF"
+        } else {
+          raster = "progressive"
+        }
+        let weaving = mode.isInterlaced && dl.fieldMode == .trueInterlace
+        text += String(format: NSLocalizedString("decklink.panel_raster",
+                                                 value: "\nraster %@, weaving %@",
+                                                 comment: "raster type and whether weaving is on"),
+                       raster, weaving ? "on" : "off")
+        let needed = mode.fps * (weaving ? 2.0 : 1.0)
         text += String(format: NSLocalizedString("decklink.panel_rate",
                                                  value: "\ncapture %.1f/s of %.2f needed",
                                                  comment: "capture rate vs required"),
