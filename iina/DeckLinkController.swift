@@ -118,6 +118,9 @@ class DeckLinkController {
   /// that simply is not working.
   var weaveStarved: Bool { tap.weaveStarved }
 
+  /// Times the cadence wanted a film frame and had none. Should stay at zero.
+  var cadenceHolds: Int { tap.cadenceHolds }
+
   /// Polls the routed player for its frame rate while output runs. On the main thread and once a
   /// second: mpv property reads must not happen on the GL thread, and the answer only changes when
   /// the file does.

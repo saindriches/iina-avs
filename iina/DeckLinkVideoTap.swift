@@ -83,11 +83,23 @@ final class DeckLinkVideoTap {
   /// Field rate of the mode, so the cadence can check the source really is 2/5 of it.
   private var fieldRate: Double = 0
 
-  /// Film frames, newest first. `incoming` is where a readback lands; the feeder promotes it.
-  private var incoming = [UInt8]()
+  /// Film frames waiting to be shown, oldest first, and buffers to read the next one back into.
+  ///
+  /// A QUEUE rather than a single slot, because the scheduled worker does not call the frame
+  /// provider at the card's rate. It fills every free buffer it can get back to back, so provider
+  /// calls arrive in bursts of up to poolSize minus the card's queue depth, four in practice. With
+  /// one slot a burst found a fresh film frame for its first call and nothing for the rest, so the
+  /// cycle held three times running and then idled: the cadence stopped being 3:2 and stuttered.
+  /// Consumption still averages the card's rate, so a queue this deep simply lets a burst take real
+  /// frames and the pattern survive.
+  private var filmReady = [[UInt8]]()
+  private var filmSpare = [[UInt8]]()
+  private static let filmQueueDepth = 4
   private var current = [UInt8]()
   private var previous = [UInt8]()
-  private var incomingIsNew = false
+  /// Times the cycle wanted a film frame and had none. Should sit at zero: anything else means
+  /// capture is not keeping up with the card and the cadence is being held rather than run.
+  private(set) var cadenceHolds = 0
   /// Which of the five output frames in the cycle comes next.
   private var cadencePhase = 0
   /// Output frames that take a fresh film frame. Phase 3 repeats, giving 4 pulls per 5 frames.
@@ -246,16 +258,21 @@ final class DeckLinkVideoTap {
     fieldRate = weaveFields ? fps * 2.0 : fps
     fieldParity = 0
     cadencePhase = 0
-    incomingIsNew = false
     working = [UInt8](repeating: 0, count: width * height * 4)
     published = [UInt8](repeating: 0, count: width * height * 4)
+    filmReady.removeAll()
+    filmSpare.removeAll()
+    cadenceHolds = 0
     if filmCadence {
-      // Three film frames in flight: one being read back, and the two a dirty output frame needs.
-      incoming = [UInt8](repeating: 0, count: width * height * 4)
+      // The two a dirty output frame needs, plus enough spares that a burst never has to allocate
+      // 8 MB on the GL thread mid-playback.
       current = [UInt8](repeating: 0, count: width * height * 4)
       previous = [UInt8](repeating: 0, count: width * height * 4)
+      for _ in 0...Self.filmQueueDepth {
+        filmSpare.append([UInt8](repeating: 0, count: width * height * 4))
+      }
     } else {
-      incoming = []; current = []; previous = []
+      current = []; previous = []
     }
     hasFrame = false
     frameComplete = !weaveFields
@@ -352,8 +369,10 @@ final class DeckLinkVideoTap {
     // The cadence assembles fields itself, on the card's clock, so a capture is simply the next
     // film frame. Filter here rather than per field: it is the same work over four fifths as many
     // frames.
-    if cadenceEngagedLocked, incoming.count == rowBytes * h {
-      incoming.withUnsafeMutableBytes { raw in
+    if cadenceEngagedLocked {
+      var buffer = filmSpare.popLast() ?? [UInt8](repeating: 0, count: rowBytes * h)
+      if buffer.count != rowBytes * h { buffer = [UInt8](repeating: 0, count: rowBytes * h) }
+      buffer.withUnsafeMutableBytes { raw in
         guard let dstBase = raw.baseAddress else { return }
         if testPattern {
           // One step per FILM frame, so the cadence's own 3:2 shows as the uneven-but-regular
@@ -368,7 +387,10 @@ final class DeckLinkVideoTap {
           memcpy(dstBase, src, rowBytes * h)
         }
       }
-      incomingIsNew = true
+      filmReady.append(buffer)
+      // Bound the queue. Dropping the OLDEST keeps latency fixed and loses the frame furthest from
+      // what should be on screen, which only happens if the card has stopped consuming.
+      while filmReady.count > Self.filmQueueDepth { filmSpare.append(filmReady.removeFirst()) }
       hasFrame = true
       frameComplete = true
       capturedFrames += 1
@@ -734,11 +756,15 @@ final class DeckLinkVideoTap {
     // Promote a film frame, if the cycle wants one and capture has produced one. If it has not,
     // hold the cycle where it is rather than advancing onto a frame that is not there: that shows
     // as one film frame held a beat longer, which is what a projector would do, instead of a torn
-    // cadence. Swaps only, so nothing here copies a frame.
-    if Self.cadencePulls[phase], incomingIsNew {
-      swap(&previous, &current)
-      swap(&current, &incoming)
-      incomingIsNew = false
+    // cadence. Buffers move by reference, so nothing here copies a frame.
+    if Self.cadencePulls[phase] {
+      if filmReady.isEmpty {
+        cadenceHolds += 1
+      } else {
+        filmSpare.append(previous)
+        previous = current
+        current = filmReady.removeFirst()
+      }
     }
 
     let rowBytes = width * 4

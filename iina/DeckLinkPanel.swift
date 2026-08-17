@@ -453,8 +453,9 @@ class DeckLinkPanelController: NSWindowController {
         var needed = mode.fps * (weaving ? 2.0 : 1.0)
         if cadence {
           needed = mode.fps * 0.8   // four film frames per five output frames
-          text += NSLocalizedString("decklink.panel_cadence", value: "\nfilm cadence 2:3 engaged",
-                                    comment: "")
+          text += String(format: NSLocalizedString("decklink.panel_cadence",
+                                                  value: "\nfilm cadence 2:3 engaged, %ld holds",
+                                                  comment: ""), dl.cadenceHolds)
         } else if dl.filmCadence && dl.filmCadenceAvailable {
           text += NSLocalizedString("decklink.panel_cadence_idle",
                                     value: "\nfilm cadence asked for, source is not 2/5 of the field rate",
