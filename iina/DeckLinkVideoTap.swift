@@ -356,9 +356,15 @@ final class DeckLinkVideoTap {
 
     // Field spacing has to match the card's, or the two moments woven into a frame are however far
     // apart the display happened to refresh. Only gates the readback: the window still draws every
-    // time. Progressive output stays ungated here, taking every draw so the card always has the
-    // freshest whole frame; it is the interlaced case that needs an even cadence.
-    if !weaveFields || shouldSample(at: CACurrentMediaTime()) {
+    // time.
+    //
+    // This used to gate the weaving case alone, which left whole frames read back at the display's
+    // rate rather than the mode's: on a 60 Hz panel driving 1080i59.94 that was 60 readbacks a
+    // second for a card consuming 29.97, and the same setting through the other capture path gated
+    // at 29.97, so one checkbox changed the rate for no reason anyone could see. Producing faster
+    // than the card consumes buys nothing but heat, and the work it wastes is what the filter and
+    // the field-rate weave need: measured, the filter alone cost three draws a second.
+    if shouldSample(at: CACurrentMediaTime()) {
       readBackCurrentFBO(width: w, height: h)
     }
 
