@@ -281,6 +281,37 @@ extension MenuController {
                                           value: "PsF carries whole progressive frames in an interlaced raster, which is right for film and any progressive source. True Interlace samples each field a field period apart, which is what a CRT's scan shows, and needs motion at the field rate to be worth anything.",
                                           comment: "")
 
+    // -- field order, which only weaving can hear: PsF puts one instant in both fields.
+    let orderMenu = NSMenu()
+    orderMenu.autoenablesItems = false
+    let reported = (dl.selectedMode?.upperFieldFirst ?? true) ? "upper" : "lower"
+    let fieldOrders: [(DeckLinkFieldOrder, String)] = [
+      (.auto, String(format: NSLocalizedString("menu.decklink_field_order_auto",
+                                               value: "Auto (%@ first)", comment: ""), reported)),
+      (.upperFirst, NSLocalizedString("menu.decklink_field_order_upper", value: "Upper Field First", comment: "")),
+      (.lowerFirst, NSLocalizedString("menu.decklink_field_order_lower", value: "Lower Field First", comment: "")),
+    ]
+    let orderEnabled = interlacedRaster && dl.fieldMode == .trueInterlace
+    for (value, title) in fieldOrders {
+      let item = orderMenu.addItem(withTitle: title,
+                                   action: #selector(menuDeckLinkSelectFieldOrder(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = value.rawValue
+      item.state = (value == dl.fieldOrder) ? .on : .off
+      item.isEnabled = orderEnabled
+    }
+    let orderName = fieldOrders.first { $0.0 == dl.fieldOrder }?.1 ?? "-"
+    let orderItem = menu.addItem(withTitle: String(format: "%@:  %@",
+                                                   NSLocalizedString("menu.decklink_field_order",
+                                                                     value: "Field Order", comment: ""),
+                                                   orderName),
+                                 action: nil, keyEquivalent: "")
+    orderItem.submenu = orderMenu
+    orderItem.isEnabled = orderEnabled
+    orderItem.toolTip = NSLocalizedString("menu.decklink_field_order_tip",
+                                          value: "Which field the card transmits first, and so which one carries the earlier moment. Auto follows the driver, which is right for a conforming chain. Backwards, motion advances two steps and falls back one at the field rate, which reads as a vibration on any pan.",
+                                          comment: "")
+
     let twitter = menu.addItem(withTitle: NSLocalizedString("menu.decklink_interline",
                                                              value: "Interline Filter", comment: ""),
                                action: #selector(menuDeckLinkToggleInterlineFilter(_:)), keyEquivalent: "")
@@ -349,6 +380,12 @@ extension MenuController {
     guard let raw = sender.representedObject as? Int,
           let link = DeckLinkSDILink(rawValue: raw) else { return }
     DeckLinkController.shared.selectSDILink(link)
+  }
+
+  @objc func menuDeckLinkSelectFieldOrder(_ sender: NSMenuItem) {
+    guard let raw = sender.representedObject as? Int,
+          let order = DeckLinkFieldOrder(rawValue: raw) else { return }
+    DeckLinkController.shared.setFieldOrder(order)
   }
 
   @objc func menuDeckLinkSelectFieldMode(_ sender: NSMenuItem) {

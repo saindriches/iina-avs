@@ -26,6 +26,7 @@ private struct Keys {
   static let use444 = "decklink.use444SDI"
   static let levelA = "decklink.levelA"
   static let fieldMode = "decklink.fieldMode"
+  static let fieldOrder = "decklink.fieldOrder"
   static let interlineFilter = "decklink.interlineFilter"
 }
 
@@ -37,6 +38,18 @@ enum DeckLinkFieldMode: Int {
   /// Each field is its own moment, a field period apart, which is what a CRT's scan actually shows.
   /// Only buys anything when the source itself carries motion at the field rate.
   case trueInterlace = 1
+}
+
+/// Which of the two fields the card transmits first, and so which one carries the earlier moment.
+///
+/// Only True Interlace is affected: PsF samples both fields at one instant, so their order cannot
+/// be heard from. Getting it backwards makes motion advance two steps and fall back one, at the
+/// field rate, which reads as a vibration on any pan.
+enum DeckLinkFieldOrder: Int {
+  /// Whatever the driver reports for the mode, which is right for a conforming chain.
+  case auto = 0
+  case upperFirst = 1
+  case lowerFirst = 2
 }
 
 class DeckLinkController {
@@ -77,6 +90,10 @@ class DeckLinkController {
   /// modes. Defaults to PsF, which is what the output has always produced, so an existing setup is
   /// unchanged until this is asked for.
   private(set) var fieldMode: DeckLinkFieldMode
+
+  /// Override for which field goes out first. Defaults to `auto`, so a chain that agrees with the
+  /// driver behaves exactly as before.
+  private(set) var fieldOrder: DeckLinkFieldOrder
 
   /// Vertical band-limit before lines are split into fields, against interline twitter on a CRT.
   /// Costs vertical resolution, so it is off unless asked for, and it is only offered on an
@@ -199,6 +216,7 @@ class DeckLinkController {
     use444 = d.bool(forKey: Keys.use444)
     levelA = d.bool(forKey: Keys.levelA)
     fieldMode = DeckLinkFieldMode(rawValue: d.object(forKey: Keys.fieldMode) as? Int ?? 0) ?? .psf
+    fieldOrder = DeckLinkFieldOrder(rawValue: d.object(forKey: Keys.fieldOrder) as? Int ?? 0) ?? .auto
     interlineFilter = d.bool(forKey: Keys.interlineFilter)
     updateActivityObservers()
     observeActivationForRestore()
@@ -292,6 +310,22 @@ class DeckLinkController {
     restartIfNeeded()
   }
 
+  func setFieldOrder(_ order: DeckLinkFieldOrder) {
+    guard order != fieldOrder else { return }
+    fieldOrder = order
+    UserDefaults.standard.set(order.rawValue, forKey: Keys.fieldOrder)
+    restartIfNeeded()
+  }
+
+  /// Which field carries the earlier moment, after any override.
+  func upperFieldFirst(for mode: DeckLinkMode) -> Bool {
+    switch fieldOrder {
+    case .auto: return mode.upperFieldFirst
+    case .upperFirst: return true
+    case .lowerFirst: return false
+    }
+  }
+
   func setInterlineFilter(_ on: Bool) {
     guard on != interlineFilter else { return }
     interlineFilter = on
@@ -357,7 +391,7 @@ class DeckLinkController {
     // either way. A progressive mode has nothing to twitter, so it never gets it.
     let filter = mode.isInterlacedOrPsF && interlineFilter
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
-                 weaveFields: weave, upperFieldFirst: mode.upperFieldFirst,
+                 weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),
                  interlineFilter: filter)
 
     var ok = false

@@ -48,6 +48,7 @@ class DeckLinkPanelController: NSWindowController {
   private var rangePopUp: NSPopUpButton!
   private var linkPopUp: NSPopUpButton!
   private var fieldPopUp: NSPopUpButton!
+  private var fieldOrderPopUp: NSPopUpButton!
   private var interlineBox: NSButton!
   private var use444Box: NSButton!
   private var levelABox: NSButton!
@@ -121,6 +122,10 @@ class DeckLinkPanelController: NSWindowController {
 
     fieldPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_fields", value: "Fields", comment: ""),
                         action: #selector(selectFieldMode(_:)))
+
+    fieldOrderPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_field_order",
+                                                          value: "Field Order", comment: ""),
+                             action: #selector(selectFieldOrder(_:)))
 
     interlineBox = addCheck(to: stack, NSLocalizedString("menu.decklink_interline",
                                                          value: "Interline Filter", comment: ""),
@@ -336,6 +341,25 @@ class DeckLinkPanelController: NSWindowController {
       fieldPopUp.selectItem(at: index)
     }
     fieldPopUp.isEnabled = interlacedRaster
+
+    // Field order only has an effect while weaving, since PsF puts one instant in both fields.
+    let reported = (dl.selectedMode?.upperFieldFirst ?? true) ? "upper" : "lower"
+    let fieldOrders: [(DeckLinkFieldOrder, String)] = [
+      (.auto, String(format: NSLocalizedString("menu.decklink_field_order_auto",
+                                               value: "Auto (%@ first)", comment: ""), reported)),
+      (.upperFirst, NSLocalizedString("menu.decklink_field_order_upper", value: "Upper Field First", comment: "")),
+      (.lowerFirst, NSLocalizedString("menu.decklink_field_order_lower", value: "Lower Field First", comment: "")),
+    ]
+    fieldOrderPopUp.removeAllItems()
+    for (value, title) in fieldOrders {
+      fieldOrderPopUp.addItem(withTitle: title)
+      fieldOrderPopUp.lastItem?.representedObject = value.rawValue
+    }
+    if let index = fieldOrders.firstIndex(where: { $0.0 == dl.fieldOrder }) {
+      fieldOrderPopUp.selectItem(at: index)
+    }
+    fieldOrderPopUp.isEnabled = interlacedRaster && dl.fieldMode == .trueInterlace
+
     interlineBox.state = dl.interlineFilter ? .on : .off
     interlineBox.isEnabled = dl.selectedMode?.isInterlacedOrPsF ?? false
 
@@ -466,6 +490,13 @@ class DeckLinkPanelController: NSWindowController {
     guard let raw = sender.selectedItem?.representedObject as? Int,
           let mode = DeckLinkFieldMode(rawValue: raw) else { return }
     DeckLinkController.shared.setFieldMode(mode)
+    refresh()
+  }
+
+  @objc private func selectFieldOrder(_ sender: NSPopUpButton) {
+    guard let raw = sender.selectedItem?.representedObject as? Int,
+          let order = DeckLinkFieldOrder(rawValue: raw) else { return }
+    DeckLinkController.shared.setFieldOrder(order)
     refresh()
   }
 
