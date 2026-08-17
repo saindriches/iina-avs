@@ -251,6 +251,10 @@ class DeckLinkPanelController: NSWindowController {
   func refresh() {
     guard window?.isVisible == true else { return }
     let dl = DeckLinkController.shared
+    // The one place that is allowed to go back to the hardware: a rebuild happens on state changes,
+    // not on a clock, so a device plugged in since last time turns up here. `refreshStatus` below
+    // must live off the cache, which is what it failed to do.
+    dl.invalidateHardwareCaches()
     dl.ensureDefaultSelection()
     dl.restoreIfNeeded()
 
@@ -455,15 +459,14 @@ class DeckLinkPanelController: NSWindowController {
           text += NSLocalizedString("decklink.panel_cadence_idle",
                                     value: "\nfilm cadence asked for, source is not 2/5 of the field rate",
                                     comment: "")
-        } else if weaving && drawsPerSecond > 1 && drawsPerSecond < needed * 0.9 {
-          // The draw loop runs when mpv has a new frame, so a 24 fps file can only ever offer 24
-          // samples a second. Weaving then builds its pairs from moments far too far apart and the
-          // card repeats what it is not given. No field order setting can rescue that, so say what
-          // will: the cadence, which needs one sample per source frame rather than one per field.
-          text += String(format: NSLocalizedString("decklink.panel_starved",
-                                                   value: "\nsource gives only %.1f frames/s, too few for a %.2f field raster; use Film Cadence",
-                                                   comment: ""),
-                         drawsPerSecond, needed)
+        } else if dl.weaveStarved {
+          // There are only as many distinct moments a second as the source has frames, so a slower
+          // source cannot make field-rate motion however it is sampled. Whole frames is the honest
+          // answer, and the rate to judge captures against becomes the source's.
+          needed = mode.fps
+          text += NSLocalizedString("decklink.panel_starved",
+                                    value: "\nsource too slow for field-rate motion, sending whole frames",
+                                    comment: "")
         }
         text += String(format: NSLocalizedString("decklink.panel_rate",
                                                  value: "\ndraw %.1f/s, capture %.1f/s of %.2f needed\nframes out %.1f/s of %.2f",

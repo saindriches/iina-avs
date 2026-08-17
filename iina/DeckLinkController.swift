@@ -113,6 +113,11 @@ class DeckLinkController {
   /// is 2/5 of the field rate. Surfaced so the panel can say so instead of leaving it ambiguous.
   var cadenceEngaged: Bool { tap.cadenceEngaged }
 
+  /// True when weaving was asked for but the source cannot fill the field rate, so whole frames are
+  /// going out instead. Surfaced because the fallback is otherwise indistinguishable from weaving
+  /// that simply is not working.
+  var weaveStarved: Bool { tap.weaveStarved }
+
   /// Polls the routed player for its frame rate while output runs. On the main thread and once a
   /// second: mpv property reads must not happen on the GL thread, and the answer only changes when
   /// the file does.
@@ -154,6 +159,29 @@ class DeckLinkController {
   }
 
   private var capabilityCache: [String: DeckLinkCapabilities] = [:]
+
+  /// Enumerating the hardware is not cheap and is not safe to do freely: every call builds a
+  /// DeckLink iterator, connects to the driver core through IOKit, and then asks each of the forty
+  /// modes three times whether it supports a pixel format. Doing that on a repeating timer, next to
+  /// a running output, crashed the app in IOServiceGetMatchingServices and churned IOKit ports.
+  ///
+  /// So enumeration happens on state changes and is cached in between. Anything polling, the status
+  /// line above all, must read these rather than ask the driver.
+  private var deviceCache: [DeckLinkDevice]?
+  /// Also an enumeration: it builds an iterator, which connects to the driver.
+  private var driverAvailableCache: Bool?
+  private var modeCache: [String: [DeckLinkMode]] = [:]
+  /// Doubly optional: the outer nil means "not resolved yet", the inner one "no mode selected".
+  private var selectedModeCache: DeckLinkMode??
+
+  /// Drop what was read from the hardware, so the next read sees a device that has been plugged in
+  /// or removed. Call from the event-rate paths (a panel or menu rebuild), never from a timer.
+  func invalidateHardwareCaches() {
+    deviceCache = nil
+    driverAvailableCache = nil
+    modeCache.removeAll()
+    selectedModeCache = nil
+  }
 
   /// What the selected device will actually accept, read from the hardware and then cached.
   var capabilities: DeckLinkCapabilities? {
@@ -198,7 +226,12 @@ class DeckLinkController {
   private(set) var lastError: String?
 
   var isRunning: Bool { output.isRunning }
-  var isDriverAvailable: Bool { DeckLinkOutput.isDriverAvailable() }
+  var isDriverAvailable: Bool {
+    if let cached = driverAvailableCache { return cached }
+    let available = DeckLinkOutput.isDriverAvailable()
+    driverAvailableCache = available
+    return available
+  }
 
   /// Frames the device reported late or dropped in this session. Surfaced so the UI can be honest
   /// about whether playout is keeping up.
@@ -244,11 +277,19 @@ class DeckLinkController {
 
   // MARK: - enumeration
 
-  var devices: [DeckLinkDevice] { DeckLinkOutput.devices() }
+  var devices: [DeckLinkDevice] {
+    if let cached = deviceCache { return cached }
+    let list = DeckLinkOutput.devices()
+    deviceCache = list
+    return list
+  }
 
   func modes(forDeviceID identifier: String?) -> [DeckLinkMode] {
     guard let device = device(withID: identifier) else { return [] }
-    return DeckLinkOutput.modes(forDeviceAt: device.index)
+    if let cached = modeCache[device.identifier] { return cached }
+    let list = DeckLinkOutput.modes(forDeviceAt: device.index)
+    modeCache[device.identifier] = list
+    return list
   }
 
   func device(withID identifier: String?) -> DeckLinkDevice? {
@@ -258,9 +299,12 @@ class DeckLinkController {
 
   var selectedDevice: DeckLinkDevice? { device(withID: selectedDeviceID) }
 
+  /// Cached, because the status line reads it every second and resolving it walks the driver.
   var selectedMode: DeckLinkMode? {
-    let all = modes(forDeviceID: selectedDeviceID)
-    return all.first { $0.index == selectedModeIndex }
+    if let cached = selectedModeCache { return cached }
+    let resolved = modes(forDeviceID: selectedDeviceID).first { $0.index == selectedModeIndex }
+    selectedModeCache = .some(resolved)
+    return resolved
   }
 
   /// True when this mode can carry the currently chosen pixel format. Used to disable menu rows
@@ -288,6 +332,7 @@ class DeckLinkController {
     guard identifier != selectedDeviceID else { return }
     selectedDeviceID = identifier
     UserDefaults.standard.set(identifier, forKey: Keys.deviceID)
+    selectedModeCache = nil
     // Mode indices are per-device, so a device change invalidates the chosen mode.
     selectedModeIndex = -1
     UserDefaults.standard.set(-1, forKey: Keys.modeIndex)
@@ -298,6 +343,7 @@ class DeckLinkController {
     guard index != selectedModeIndex else { return }
     selectedModeIndex = index
     UserDefaults.standard.set(index, forKey: Keys.modeIndex)
+    selectedModeCache = nil
     restartIfNeeded()
   }
 
@@ -373,8 +419,12 @@ class DeckLinkController {
   }
 
   /// Frame rate of the file the routed player is showing, or 0 when there is nothing to ask.
+  ///
+  /// The state check is not optional. This runs on a timer, and the window it polls can close or
+  /// quit underneath it; PlayerCore is explicit that reading a property from a core that has shut
+  /// down is not permitted and can crash. Anything below `loaded` has no file to report anyway.
   private func routedSourceFrameRate() -> Double {
-    guard let player = routedPlayer, let mpv = player.mpv else { return 0 }
+    guard let player = routedPlayer, player.info.state.loaded, let mpv = player.mpv else { return 0 }
     let fps = mpv.getDouble(MPVProperty.containerFps)
     return fps.isFinite && fps > 0 ? fps : 0
   }
@@ -551,6 +601,7 @@ class DeckLinkController {
   /// IINA started is picked up without the user toggling anything.
   func restoreIfNeeded() {
     guard routingEnabled, !output.isRunning, isDriverAvailable else { return }
+    invalidateHardwareCaches()   // event rate, so a card plugged in since last time is seen
     ensureDefaultSelection()
     guard canStart else { return }
     startDevice()

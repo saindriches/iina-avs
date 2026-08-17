@@ -59,6 +59,7 @@ extension MenuController {
   /// Rebuild the submenu from what the hardware currently reports.
   func updateDeckLinkMenu(_ menu: NSMenu) {
     let dl = DeckLinkController.shared
+    dl.invalidateHardwareCaches()   // opening the menu is a fine moment to re-read the hardware
     dl.ensureDefaultSelection()
     dl.restoreIfNeeded()   // picks up a device plugged in after launch
     menu.removeAllItems()

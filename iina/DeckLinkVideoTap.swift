@@ -107,6 +107,29 @@ final class DeckLinkVideoTap {
     return cadenceEngagedLocked
   }
 
+  /// Weaving asked for on a source that cannot supply a moment per field.
+  ///
+  /// The draw loop runs when mpv has a new frame, so a 24 fps file offers 24 samples a second
+  /// however fast the display refreshes. Pairing consecutive samples then puts two moments 41ms
+  /// apart into fields that are meant to be 16.7ms apart, which is not interlace, just mangled
+  /// timing. There are only 24 distinct moments a second in the source, so no amount of sampling
+  /// can invent field-rate motion.
+  ///
+  /// The honest answer is whole frames: both fields from one instant, which is PsF. The card still
+  /// repeats what it is not given, but each frame it shows is at least internally consistent.
+  /// 2:3 is better where it applies, and takes priority; this is the fallback for everything else,
+  /// 30p on a 60 field raster being the common one. Caller holds `lock`.
+  private var weaveStarvedLocked: Bool {
+    guard weaveFields, !cadenceEngagedLocked, sourceFrameRate > 0, fieldRate > 0 else { return false }
+    return sourceFrameRate < fieldRate * 0.9
+  }
+
+  var weaveStarved: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return weaveStarvedLocked
+  }
+
   /// mpv's reported frame rate for the current file, which can change when the file does.
   func updateSourceFrameRate(_ fps: Double) {
     lock.lock()
@@ -248,7 +271,9 @@ final class DeckLinkVideoTap {
   /// fields itself; weaving without it wants one per field; anything else one per frame.
   /// Caller holds `lock`.
   private func updateSampleIntervalLocked() {
-    let rate = cadenceEngagedLocked ? sourceFrameRate : fieldRate
+    // Never sample faster than the source changes: with the cadence, or when weaving has fallen
+    // back to whole frames, the extra readbacks would all be of the same picture.
+    let rate = (cadenceEngagedLocked || weaveStarvedLocked) ? sourceFrameRate : fieldRate
     sampleInterval = rate > 0 ? 1.0 / rate : 0
   }
 
@@ -350,6 +375,11 @@ final class DeckLinkVideoTap {
       return
     }
 
+    // Fall back to whole frames when the source cannot supply a moment per field. Pairing samples
+    // that are a source frame apart is not interlace, and the test pattern shows exactly what it
+    // costs: whole frames repeated, which reads as a step backwards at every frame boundary.
+    let weaving = weaveFields && !weaveStarvedLocked
+
     working.withUnsafeMutableBytes { raw in
       guard let dstBase = raw.baseAddress else { return }
       let srcWords = src.assumingMemoryBound(to: UInt32.self)
@@ -364,8 +394,11 @@ final class DeckLinkVideoTap {
         }
       }
 
-      guard weaveFields else {
-        if interlineFilter {
+      guard weaving else {
+        if testPattern {
+          drawTestBar(dstBase, width: w, height: h, step: testStep, startRow: 0, everyOtherRow: false)
+          testStep += 1
+        } else if interlineFilter {
           for y in 0..<h { copyRow(y) }
         } else {
           memcpy(dstBase, src, rowBytes * h)   // untouched fast path
@@ -386,9 +419,9 @@ final class DeckLinkVideoTap {
       var y = first
       while y < h { copyRow(y); y += 2 }
     }
-    if weaveFields { fieldParity ^= 1 }
+    if weaving { fieldParity ^= 1 }
     // Parity back at 0 means the second field of the pair has just landed.
-    frameComplete = !weaveFields || fieldParity == 0
+    frameComplete = !weaving || fieldParity == 0
     capturedFrames += 1
     guard frameComplete else { return }
 
