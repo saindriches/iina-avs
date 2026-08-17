@@ -118,6 +118,43 @@ final class DeckLinkVideoTap {
     lock.unlock()
   }
 
+  // MARK: - field order test pattern
+
+  /// Replace the picture with something whose temporal order can be READ off the monitor.
+  ///
+  /// Field order cannot be judged from ordinary footage: a wrong order looks like bad motion, which
+  /// is also what a dropped field, a repeated frame and a wandering cadence look like. So put out a
+  /// bar that advances a fixed step every field and nothing else. Then the monitor answers directly:
+  ///
+  /// - smooth sweep, even steps      -> fields are in the right order
+  /// - sweep with a back-step every other field -> the two fields of a frame are swapped
+  /// - sweep that stalls and jumps   -> frames are being repeated or dropped, not misordered
+  ///
+  /// The bar is generated where the real picture would have been stored, so it goes through the same
+  /// weaving, cadence, packing and scheduling as video does. It tests the path, not just the maths.
+  var testPattern = false
+  /// Advances once per field written (or per film frame, with the cadence running).
+  private var testStep = 0
+
+  /// Paint the bar for step `step` into `dst`, on `rows` only, leaving other rows untouched.
+  private func drawTestBar(_ dst: UnsafeMutableRawPointer, width w: Int, height h: Int,
+                           step: Int, startRow: Int, everyOtherRow: Bool) {
+    // 10-bit 2:10:10:10, matching the capture format. Full-range white and a dim grey ground, so a
+    // field that never gets written reads as black rather than as part of the pattern.
+    let white: UInt32 = 0xFFFF_FFFF
+    let ground: UInt32 = (1 << 30) | (64 << 20) | (64 << 10) | 64
+    let barWidth = max(8, w / 60)
+    let travel = max(1, w / 48)                 // one step per field, wrapping across the raster
+    let x0 = (step * travel) % max(1, w - barWidth)
+
+    var y = startRow
+    while y < h {
+      let row = dst.advanced(by: y * w * 4).assumingMemoryBound(to: UInt32.self)
+      for x in 0..<w { row[x] = (x >= x0 && x < x0 + barWidth) ? white : ground }
+      y += everyOtherRow ? 2 : 1
+    }
+  }
+
   /// Vertical low-pass before the lines are split into fields.
   ///
   /// A CRT draws alternate lines in alternate fields, so any detail that lives on a single line
@@ -293,7 +330,12 @@ final class DeckLinkVideoTap {
     if cadenceEngagedLocked, incoming.count == rowBytes * h {
       incoming.withUnsafeMutableBytes { raw in
         guard let dstBase = raw.baseAddress else { return }
-        if interlineFilter {
+        if testPattern {
+          // One step per FILM frame, so the cadence's own 3:2 shows as the uneven-but-regular
+          // telecine beat rather than as a smooth sweep.
+          drawTestBar(dstBase, width: w, height: h, step: testStep, startRow: 0, everyOtherRow: false)
+          testStep += 1
+        } else if interlineFilter {
           let srcWords = src.assumingMemoryBound(to: UInt32.self)
           let dstWords = dstBase.assumingMemoryBound(to: UInt32.self)
           for y in 0..<h { filteredRow(srcWords, dstWords.advanced(by: y * w), width: w, y: y, height: h) }
@@ -334,6 +376,13 @@ final class DeckLinkVideoTap {
       // Only this field's rows. The other half of `working` still holds the frame published two
       // pairs ago and is overwritten by this pair's second sample before anything sees it.
       let first = fieldStartRow()
+      if testPattern {
+        // One step per FIELD. A correct order sweeps evenly; swapped fields step back every other
+        // one; a starved or repeated frame makes the sweep stall and jump.
+        drawTestBar(dstBase, width: w, height: h, step: testStep, startRow: first, everyOtherRow: true)
+        testStep += 1
+        return
+      }
       var y = first
       while y < h { copyRow(y); y += 2 }
     }

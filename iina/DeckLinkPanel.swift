@@ -51,6 +51,7 @@ class DeckLinkPanelController: NSWindowController {
   private var fieldOrderPopUp: NSPopUpButton!
   private var interlineBox: NSButton!
   private var filmCadenceBox: NSButton!
+  private var testPatternBox: NSButton!
   private var use444Box: NSButton!
   private var levelABox: NSButton!
   private var nativeRenderBox: NSButton!
@@ -147,6 +148,13 @@ class DeckLinkPanelController: NSWindowController {
     releaseBox = addCheck(to: stack, NSLocalizedString("menu.decklink_release",
                                                        value: "Release Device When Inactive", comment: ""),
                           action: #selector(toggleRelease(_:)))
+
+    testPatternBox = addCheck(to: stack, NSLocalizedString("menu.decklink_test_pattern",
+                                                           value: "Field Order Test Pattern", comment: ""),
+                              action: #selector(toggleTestPattern(_:)))
+    testPatternBox.toolTip = NSLocalizedString("menu.decklink_test_pattern_tip",
+                                               value: "Replace the picture with a bar that advances one step every field. An even sweep means the fields are in the right order; a back-step every other field means they are swapped; a sweep that stalls and jumps means frames are being repeated, not misordered.",
+                                               comment: "")
 
     guard let content = window?.contentView else { return }
     content.addSubview(stack)
@@ -382,7 +390,8 @@ class DeckLinkPanelController: NSWindowController {
     nativeRenderBox.state = dl.renderAtOutputResolution ? .on : .off
     lowLatencyBox.state = dl.lowLatency ? .on : .off
     releaseBox.state = dl.releaseWhenInactive ? .on : .off
-    [nativeRenderBox, lowLatencyBox, releaseBox].forEach { $0?.isEnabled = true }
+    testPatternBox.state = dl.testPattern ? .on : .off
+    [nativeRenderBox, lowLatencyBox, releaseBox, testPatternBox].forEach { $0?.isEnabled = true }
 
     window?.setContentSize(NSSize(width: 340, height: fittingHeight()))
   }
@@ -418,7 +427,11 @@ class DeckLinkPanelController: NSWindowController {
         // never engages however the Fields row is set, which looks identical to being too slow.
         let raster: String
         if mode.isInterlaced {
-          raster = mode.upperFieldFirst ? "interlaced, upper first" : "interlaced, lower first"
+          // The EFFECTIVE order, not the driver's. Reporting the driver's meant the line could
+          // never say "lower first", so an override could not be confirmed from the panel.
+          let upper = dl.upperFieldFirst(for: mode)
+          let overridden = dl.fieldOrder != .auto ? ", forced" : ""
+          raster = "interlaced, \(upper ? "upper" : "lower") first\(overridden)"
         } else if mode.isInterlacedOrPsF {
           raster = "PsF"
         } else {
@@ -442,6 +455,15 @@ class DeckLinkPanelController: NSWindowController {
           text += NSLocalizedString("decklink.panel_cadence_idle",
                                     value: "\nfilm cadence asked for, source is not 2/5 of the field rate",
                                     comment: "")
+        } else if weaving && drawsPerSecond > 1 && drawsPerSecond < needed * 0.9 {
+          // The draw loop runs when mpv has a new frame, so a 24 fps file can only ever offer 24
+          // samples a second. Weaving then builds its pairs from moments far too far apart and the
+          // card repeats what it is not given. No field order setting can rescue that, so say what
+          // will: the cadence, which needs one sample per source frame rather than one per field.
+          text += String(format: NSLocalizedString("decklink.panel_starved",
+                                                   value: "\nsource gives only %.1f frames/s, too few for a %.2f field raster; use Film Cadence",
+                                                   comment: ""),
+                         drawsPerSecond, needed)
         }
         text += String(format: NSLocalizedString("decklink.panel_rate",
                                                  value: "\ndraw %.1f/s, capture %.1f/s of %.2f needed\nframes out %.1f/s of %.2f",
@@ -551,6 +573,11 @@ class DeckLinkPanelController: NSWindowController {
 
   @objc private func toggleLowLatency(_ sender: NSButton) {
     DeckLinkController.shared.lowLatency = (sender.state == .on)
+    refresh()
+  }
+
+  @objc private func toggleTestPattern(_ sender: NSButton) {
+    DeckLinkController.shared.testPattern = (sender.state == .on)
     refresh()
   }
 

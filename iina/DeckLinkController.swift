@@ -352,6 +352,14 @@ class DeckLinkController {
     restartIfNeeded()
   }
 
+  /// Replace the picture with a bar that steps once per field, so field order can be read off the
+  /// monitor instead of inferred from how motion feels. Not persisted: it is a diagnostic, and
+  /// coming back to a bar instead of a picture would be its own bug report.
+  var testPattern: Bool {
+    get { tap.testPattern }
+    set { tap.testPattern = newValue; notifyChanged() }
+  }
+
   func setFilmCadence(_ on: Bool) {
     guard on != filmCadence else { return }
     filmCadence = on
