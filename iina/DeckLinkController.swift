@@ -29,6 +29,7 @@ private struct Keys {
   static let fieldOrder = "decklink.fieldOrder"
   static let interlineFilter = "decklink.interlineFilter"
   static let filmCadence = "decklink.filmCadence"
+  static let scaling = "decklink.scaling"
 }
 
 /// How the two fields of an interlaced frame are produced.
@@ -39,6 +40,17 @@ enum DeckLinkFieldMode: Int {
   /// Each field is its own moment, a field period apart, which is what a CRT's scan actually shows.
   /// Only buys anything when the source itself carries motion at the field rate.
   case trueInterlace = 1
+}
+
+/// What to do when the picture and the SDI raster are not the same shape.
+enum DeckLinkScaling: Int {
+  /// Whole picture, bars where the shapes differ. What a broadcast chain expects, and the default.
+  case fit = 0
+  /// Fill the raster and lose what hangs over the edges.
+  case fill = 1
+  /// Distort to fill. Almost never right, but it is what this did before there was a choice, so it
+  /// stays available.
+  case stretch = 2
 }
 
 /// Which of the two fields the card transmits first, and so which one carries the earlier moment.
@@ -108,6 +120,9 @@ class DeckLinkController {
   /// pushes rather than when the card asks, and a cadence clocked by the producer is exactly what
   /// this exists to avoid.
   private(set) var filmCadence: Bool
+
+  /// How a picture of a different shape is mapped onto the SDI raster.
+  private(set) var scaling: DeckLinkScaling
 
   /// True while the cadence is not merely asked for but running, which needs a source that really
   /// is 2/5 of the field rate. Surfaced so the panel can say so instead of leaving it ambiguous.
@@ -273,6 +288,7 @@ class DeckLinkController {
     fieldOrder = DeckLinkFieldOrder(rawValue: d.object(forKey: Keys.fieldOrder) as? Int ?? 0) ?? .auto
     interlineFilter = d.bool(forKey: Keys.interlineFilter)
     filmCadence = d.bool(forKey: Keys.filmCadence)
+    scaling = DeckLinkScaling(rawValue: d.object(forKey: Keys.scaling) as? Int ?? 0) ?? .fit
     updateActivityObservers()
     observeActivationForRestore()
     observeSleepWake()
@@ -409,6 +425,14 @@ class DeckLinkController {
     set { tap.testPattern = newValue; notifyChanged() }
   }
 
+  func setScaling(_ mode: DeckLinkScaling) {
+    guard mode != scaling else { return }
+    scaling = mode
+    UserDefaults.standard.set(mode.rawValue, forKey: Keys.scaling)
+    tap.scaling = mode   // takes effect on the next frame; no need to restart the device
+    notifyChanged()
+  }
+
   func setFilmCadence(_ on: Bool) {
     guard on != filmCadence else { return }
     filmCadence = on
@@ -507,6 +531,7 @@ class DeckLinkController {
     let filter = mode.isInterlacedOrPsF && interlineFilter
     // The cadence needs the card to clock the consumer, so it is only offered off the low-latency
     // path. Asking for it elsewhere leaves ordinary weaving rather than half-applying it.
+    tap.scaling = scaling
     let cadence = weave && filmCadence && !lowLatency
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
                  weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),

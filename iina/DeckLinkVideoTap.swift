@@ -212,6 +212,59 @@ final class DeckLinkVideoTap {
   private var pboIndex = 0
   private var pboPrimed = false
 
+  // MARK: - geometry
+
+  /// How a picture of a different shape is mapped onto the SDI raster.
+  var scaling: DeckLinkScaling = .fit
+
+  /// Where a source of `sourceAspect` lands in a `w` x `h` target, in TOP-DOWN pixels.
+  ///
+  /// Both blits used to ignore this entirely and just stretch corner to corner, which is wrong in
+  /// both directions: a 4:3 window went out as a 16:9 raster stretched, and a 16:9 raster came back
+  /// into a 4:3 window squeezed on the x axis. Fullscreen made the second worse again, because the
+  /// window then carries the DISPLAY's shape rather than the video's.
+  ///
+  /// `fill` deliberately returns a rectangle larger than the target; the blit clips it, which is the
+  /// crop. `stretch` returns the target, which is the old behaviour.
+  private func destinationRect(sourceAspect: Double, width w: Int, height h: Int)
+      -> (left: Int, top: Int, right: Int, bottom: Int) {
+    let full = (left: 0, top: 0, right: w, bottom: h)
+    guard sourceAspect > 0, w > 0, h > 0, scaling != .stretch else { return full }
+    let targetAspect = Double(w) / Double(h)
+    if abs(sourceAspect - targetAspect) < 0.001 { return full }
+
+    // Wider than the target: fit puts bars top and bottom, fill overflows left and right.
+    let widerThanTarget = sourceAspect > targetAspect
+    let matchWidth = (scaling == .fit) == widerThanTarget
+    if matchWidth {
+      let scaledHeight = Int((Double(w) / sourceAspect).rounded())
+      let offset = (h - scaledHeight) / 2
+      return (left: 0, top: offset, right: w, bottom: offset + scaledHeight)
+    }
+    let scaledWidth = Int((Double(h) * sourceAspect).rounded())
+    let offset = (w - scaledWidth) / 2
+    return (left: offset, top: 0, right: offset + scaledWidth, bottom: h)
+  }
+
+  /// Blit a source rectangle into a destination, flipping Y and honouring `scaling`.
+  ///
+  /// The destination Y range is inverted because GL reads from the bottom while the card and the
+  /// window both want the top first. Bars are cleared to black rather than left as whatever the
+  /// previous frame put there.
+  private func blitPreservingAspect(sourceWidth sw: Int, sourceHeight sh: Int,
+                                    destWidth dw: Int, destHeight dh: Int) {
+    let rect = destinationRect(sourceAspect: sh > 0 ? Double(sw) / Double(sh) : 0,
+                               width: dw, height: dh)
+    if rect.left > 0 || rect.top > 0 || rect.right < dw || rect.bottom < dh {
+      glClearColor(0, 0, 0, 1)
+      glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
+    }
+    glBlitFramebuffer(0, 0, GLint(sw), GLint(sh),
+                      GLint(rect.left), GLint(dh - rect.top),
+                      GLint(rect.right), GLint(dh - rect.bottom),
+                      GLbitfield(GL_COLOR_BUFFER_BIT), GLenum(GL_LINEAR))
+  }
+
   /// Read pixels back synchronously instead of through the PBO ping-pong. The ping-pong hides the
   /// GPU stall by mapping the previous capture, which costs a full frame of delay: negligible
   /// behind the scheduled queue, dominant without it. A direct HD readback is a couple of
@@ -511,15 +564,16 @@ final class DeckLinkVideoTap {
     glGetIntegerv(GLenum(GL_DRAW_FRAMEBUFFER_BINDING), &prevDrawFBO)
     glGetIntegerv(GLenum(GL_VIEWPORT), &prevViewport)
 
-    // Scale IINA's rendered frame into ours. The destination Y range is inverted (dstY0 = h,
-    // dstY1 = 0) to undo the on-screen pass's FLIP_Y, so that glReadPixels, which reads bottom-up,
-    // hands back rows top-down as the card wants.
+    // Scale IINA's rendered frame into ours, keeping its shape. The window is sized to the video,
+    // so its aspect is the video's; stretching it to the raster is what sent 4:3 out as a squashed
+    // 16:9. In fullscreen the window carries the display's shape instead, bars included, so fitting
+    // that is still geometrically right even though it doubles the bars.
     glBindFramebuffer(GLenum(GL_READ_FRAMEBUFFER), sourceFBO)
     glReadBuffer(GLenum(GL_COLOR_ATTACHMENT0))
     glBindFramebuffer(GLenum(GL_DRAW_FRAMEBUFFER), fbo)
-    glBlitFramebuffer(0, 0, GLint(sourceWidth), GLint(sourceHeight),
-                      0, GLint(h), GLint(w), 0,
-                      GLbitfield(GL_COLOR_BUFFER_BIT), GLenum(GL_LINEAR))
+    glViewport(0, 0, GLsizei(w), GLsizei(h))   // glClear obeys the viewport's scissor-free bounds
+    blitPreservingAspect(sourceWidth: sourceWidth, sourceHeight: sourceHeight,
+                         destWidth: w, destHeight: h)
 
     readBackCurrentFBO(width: w, height: h)
 
@@ -585,12 +639,20 @@ final class DeckLinkVideoTap {
 
     // Preview to the window from the same render. Y is inverted here because the SDI render is
     // unflipped and the screen expects the on-screen orientation.
+    //
+    // Always FIT, whatever the SDI mapping is set to. What we hold is a finished raster of the
+    // mode's shape, and IINA sizes its window to the VIDEO, so stretching one into the other
+    // squeezed the preview on the x axis whenever the two differed. The preview's job is to show
+    // what is going out, which means keeping its shape.
+    let previewScaling = scaling
+    scaling = .fit
     glBindFramebuffer(GLenum(GL_READ_FRAMEBUFFER), fbo)
     glReadBuffer(GLenum(GL_COLOR_ATTACHMENT0))
     glBindFramebuffer(GLenum(GL_DRAW_FRAMEBUFFER), screenFBO)
-    glBlitFramebuffer(0, 0, GLint(w), GLint(h),
-                      0, GLint(screenHeight), GLint(screenWidth), 0,
-                      GLbitfield(GL_COLOR_BUFFER_BIT), GLenum(GL_LINEAR))
+    glViewport(0, 0, GLsizei(screenWidth), GLsizei(screenHeight))
+    blitPreservingAspect(sourceWidth: w, sourceHeight: h,
+                         destWidth: screenWidth, destHeight: screenHeight)
+    scaling = previewScaling
 
     glBindFramebuffer(GLenum(GL_FRAMEBUFFER), screenFBO)
     glViewport(prevViewport[0], prevViewport[1], GLsizei(prevViewport[2]), GLsizei(prevViewport[3]))

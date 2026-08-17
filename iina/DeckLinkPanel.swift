@@ -49,6 +49,7 @@ class DeckLinkPanelController: NSWindowController {
   private var linkPopUp: NSPopUpButton!
   private var fieldPopUp: NSPopUpButton!
   private var fieldOrderPopUp: NSPopUpButton!
+  private var scalingPopUp: NSPopUpButton!
   private var interlineBox: NSButton!
   private var filmCadenceBox: NSButton!
   private var testPatternBox: NSButton!
@@ -111,6 +112,9 @@ class DeckLinkPanelController: NSWindowController {
                          action: #selector(selectFormat(_:)))
     rangePopUp = addRow(to: stack, NSLocalizedString("menu.decklink_levels", value: "Levels", comment: ""),
                         action: #selector(selectRange(_:)))
+    scalingPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_scaling",
+                                                       value: "Aspect Handling", comment: ""),
+                          action: #selector(selectScaling(_:)))
 
     stack.addArrangedSubview(separator())
     stack.addArrangedSubview(sectionLabel(NSLocalizedString("menu.decklink_sdi", value: "SDI Signal", comment: "")))
@@ -326,6 +330,27 @@ class DeckLinkPanelController: NSWindowController {
       rangePopUp.selectItem(at: index)
     }
 
+    // -- aspect handling, for when the picture and the raster are different shapes
+    let scalings: [(DeckLinkScaling, String)] = [
+      (.fit, NSLocalizedString("menu.decklink_scaling_fit", value: "Fit (letterbox)", comment: "")),
+      (.fill, NSLocalizedString("menu.decklink_scaling_fill", value: "Fill (crop)", comment: "")),
+      (.stretch, NSLocalizedString("menu.decklink_scaling_stretch", value: "Stretch (distort)", comment: "")),
+    ]
+    scalingPopUp.removeAllItems()
+    for (value, title) in scalings {
+      scalingPopUp.addItem(withTitle: title)
+      scalingPopUp.lastItem?.representedObject = value.rawValue
+    }
+    if let index = scalings.firstIndex(where: { $0.0 == dl.scaling }) {
+      scalingPopUp.selectItem(at: index)
+    }
+    // With Render at Output Resolution on, mpv draws into the raster and does the fitting itself,
+    // so this has nothing left to decide. Say so by disabling it rather than letting it look live.
+    scalingPopUp.isEnabled = !dl.renderAtOutputResolution
+    scalingPopUp.toolTip = NSLocalizedString("menu.decklink_scaling_tip",
+                                             value: "What to do when the picture and the SDI raster are different shapes. Fit keeps the whole picture and adds bars, which is what a broadcast chain expects. Ignored under Render at Output Resolution, where mpv renders straight into the raster and fits it itself.",
+                                             comment: "")
+
     // -- SDI signal, gated on what the device says it implements
     let caps = dl.capabilities
     let links: [(DeckLinkSDILink, String, Bool)] = [
@@ -540,6 +565,13 @@ class DeckLinkPanelController: NSWindowController {
     guard let raw = sender.selectedItem?.representedObject as? Int,
           let mode = DeckLinkFieldMode(rawValue: raw) else { return }
     DeckLinkController.shared.setFieldMode(mode)
+    refresh()
+  }
+
+  @objc private func selectScaling(_ sender: NSPopUpButton) {
+    guard let raw = sender.selectedItem?.representedObject as? Int,
+          let mode = DeckLinkScaling(rawValue: raw) else { return }
+    DeckLinkController.shared.setScaling(mode)
     refresh()
   }
 

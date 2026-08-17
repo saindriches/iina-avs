@@ -254,6 +254,34 @@ extension MenuController {
                                            value: "SMPTE Level A signalling for 3G-SDI. Level B is the default and more widely accepted; some monitors and routers require A.",
                                            comment: "")
 
+    // -- aspect handling
+    let scalingMenu = NSMenu()
+    scalingMenu.autoenablesItems = false
+    let scalings: [(DeckLinkScaling, String)] = [
+      (.fit, NSLocalizedString("menu.decklink_scaling_fit", value: "Fit (letterbox)", comment: "")),
+      (.fill, NSLocalizedString("menu.decklink_scaling_fill", value: "Fill (crop)", comment: "")),
+      (.stretch, NSLocalizedString("menu.decklink_scaling_stretch", value: "Stretch (distort)", comment: "")),
+    ]
+    for (value, title) in scalings {
+      let item = scalingMenu.addItem(withTitle: title,
+                                     action: #selector(menuDeckLinkSelectScaling(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = value.rawValue
+      item.state = (value == dl.scaling) ? .on : .off
+      item.isEnabled = !dl.renderAtOutputResolution
+    }
+    let scalingName = scalings.first { $0.0 == dl.scaling }?.1 ?? "-"
+    let scalingItem = menu.addItem(withTitle: String(format: "%@:  %@",
+                                                     NSLocalizedString("menu.decklink_scaling",
+                                                                       value: "Aspect Handling", comment: ""),
+                                                     scalingName),
+                                   action: nil, keyEquivalent: "")
+    scalingItem.submenu = scalingMenu
+    scalingItem.isEnabled = !dl.renderAtOutputResolution
+    scalingItem.toolTip = NSLocalizedString("menu.decklink_scaling_tip",
+                                            value: "What to do when the picture and the SDI raster are different shapes. Fit keeps the whole picture and adds bars, which is what a broadcast chain expects. Ignored under Render at Output Resolution, where mpv renders straight into the raster and fits it itself.",
+                                            comment: "")
+
     // -- field mode, only meaningful on an interlaced raster. PsF rasters and progressive modes have
     // nothing to choose, so the row is offered but disabled rather than silently ignored.
     let interlacedRaster = dl.selectedMode?.isInterlaced ?? false
@@ -391,6 +419,12 @@ extension MenuController {
     guard let raw = sender.representedObject as? Int,
           let link = DeckLinkSDILink(rawValue: raw) else { return }
     DeckLinkController.shared.selectSDILink(link)
+  }
+
+  @objc func menuDeckLinkSelectScaling(_ sender: NSMenuItem) {
+    guard let raw = sender.representedObject as? Int,
+          let mode = DeckLinkScaling(rawValue: raw) else { return }
+    DeckLinkController.shared.setScaling(mode)
   }
 
   @objc func menuDeckLinkToggleFilmCadence(_ sender: NSMenuItem) {
