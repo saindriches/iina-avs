@@ -29,10 +29,11 @@ final class DeckLinkVideoTap {
   /// Size the SDI output wants. Set when routing starts; nil disables capture entirely.
   private var targetWidth = 0
   private var targetHeight = 0
-  /// Capture no faster than the mode's frame rate: with a 60 Hz panel feeding 23.98 SDI there is
-  /// no point paying for a readback per screen refresh.
-  private var minInterval: CFTimeInterval = 0
-  private var lastCaptureAt: CFTimeInterval = 0
+  /// How far apart samples should be: the mode's frame rate, or its FIELD rate when weaving. With a
+  /// 60 Hz panel feeding 23.98 SDI there is no point paying for a readback per screen refresh.
+  private var sampleInterval: CFTimeInterval = 0
+  /// When the next sample is ideally due. See `shouldSample`.
+  private var nextSampleAt: CFTimeInterval = 0
 
   /// True interlace: the two fields of a frame must be DIFFERENT moments, 1/fieldRate apart, which
   /// is what a CRT's scan actually shows. PsF is the other case and needs none of this, because both
@@ -113,7 +114,7 @@ final class DeckLinkVideoTap {
     // Sample at the FIELD rate when weaving, since each field is its own moment. `fps` is the frame
     // rate the card reports, so 1080i59.94 arrives here as 29.97 and must be captured at 59.94.
     let sampleRate = weaveFields ? fps * 2.0 : fps
-    minInterval = sampleRate > 0 ? (1.0 / sampleRate) * 0.9 : 0   // 0.9 so jitter never starves the card
+    sampleInterval = sampleRate > 0 ? 1.0 / sampleRate : 0
     working = [UInt8](repeating: 0, count: width * height * 4)
     published = [UInt8](repeating: 0, count: width * height * 4)
     hasFrame = false
@@ -121,8 +122,34 @@ final class DeckLinkVideoTap {
     capturedFrames = 0
     publishedFrames = 0
     hookCalls = 0
-    lastCaptureAt = 0
+    nextSampleAt = 0
     lock.unlock()
+  }
+
+  /// Whether this draw is the one to sample, keeping the long-run rate at `sampleInterval`.
+  ///
+  /// A plain "no sooner than X since the last one" cannot do this job. Set tight, it discards a draw
+  /// whenever the display refresh jitters early, and at the field rate the window for that is only a
+  /// hair wider than the refresh itself: measured, it was losing 5 draws of every 60, which is a
+  /// field pair that never completed roughly four times a second. Set loose, it settles at some
+  /// multiple of the wanted rate on a fast panel.
+  ///
+  /// So track when the next sample is DUE and take whichever draw lands nearest it. Half an interval
+  /// of slack is what makes it jitter-immune, and it still halves cleanly on a display running at
+  /// twice the rate we need.
+  ///
+  /// Caller is on the GL thread.
+  private func shouldSample(at now: CFTimeInterval) -> Bool {
+    guard sampleInterval > 0 else { return true }
+    guard nextSampleAt > 0 else {          // first sample of the session sets the phase
+      nextSampleAt = now + sampleInterval
+      return true
+    }
+    guard now >= nextSampleAt - sampleInterval / 2 else { return false }
+    // Advance from whichever is later, so a stall resets the phase rather than being followed by a
+    // burst of samples catching up on a schedule that has fallen behind real time.
+    nextSampleAt = max(now, nextSampleAt) + sampleInterval
+    return true
   }
 
   /// Row the current field starts on. The earlier sample has to land in the field the card transmits
@@ -255,15 +282,12 @@ final class DeckLinkVideoTap {
   func capture(renderContext: OpaquePointer, sourceFBO: GLuint,
                sourceWidth: Int, sourceHeight: Int) {
     lock.lock()
-    let w = targetWidth, h = targetHeight, interval = minInterval
+    let w = targetWidth, h = targetHeight
     lock.unlock()
     guard w > 0, h > 0 else { return }
     hookCalls += 1
 
-    let now = CACurrentMediaTime()
-    guard now - lastCaptureAt >= interval else { return }
-    lastCaptureAt = now
-
+    guard shouldSample(at: CACurrentMediaTime()) else { return }
     guard ensureFramebuffer(width: w, height: h) else { return }
 
     // Save the caller's binding and viewport; ViewLayer keeps rendering into its own FBO after us.
@@ -332,14 +356,11 @@ final class DeckLinkVideoTap {
 
     // Field spacing has to match the card's, or the two moments woven into a frame are however far
     // apart the display happened to refresh. Only gates the readback: the window still draws every
-    // time, and progressive output is unaffected because `minInterval` gating stays off for it.
-    var takeIt = true
-    if weaveFields {
-      let now = CACurrentMediaTime()
-      takeIt = now - lastCaptureAt >= minInterval
-      if takeIt { lastCaptureAt = now }
+    // time. Progressive output stays ungated here, taking every draw so the card always has the
+    // freshest whole frame; it is the interlaced case that needs an even cadence.
+    if !weaveFields || shouldSample(at: CACurrentMediaTime()) {
+      readBackCurrentFBO(width: w, height: h)
     }
-    if takeIt { readBackCurrentFBO(width: w, height: h) }
 
     // Preview to the window from the same render. Y is inverted here because the SDI render is
     // unflipped and the screen expects the on-screen orientation.
