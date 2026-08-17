@@ -50,6 +50,7 @@ class DeckLinkPanelController: NSWindowController {
   private var fieldPopUp: NSPopUpButton!
   private var fieldOrderPopUp: NSPopUpButton!
   private var interlineBox: NSButton!
+  private var filmCadenceBox: NSButton!
   private var use444Box: NSButton!
   private var levelABox: NSButton!
   private var nativeRenderBox: NSButton!
@@ -126,6 +127,10 @@ class DeckLinkPanelController: NSWindowController {
     fieldOrderPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_field_order",
                                                           value: "Field Order", comment: ""),
                              action: #selector(selectFieldOrder(_:)))
+
+    filmCadenceBox = addCheck(to: stack, NSLocalizedString("menu.decklink_film_cadence",
+                                                            value: "Film Cadence (2:3 Pulldown)", comment: ""),
+                              action: #selector(toggleFilmCadence(_:)))
 
     interlineBox = addCheck(to: stack, NSLocalizedString("menu.decklink_interline",
                                                          value: "Interline Filter", comment: ""),
@@ -360,6 +365,12 @@ class DeckLinkPanelController: NSWindowController {
     }
     fieldOrderPopUp.isEnabled = interlacedRaster && dl.fieldMode == .trueInterlace
 
+    filmCadenceBox.state = dl.filmCadence ? .on : .off
+    filmCadenceBox.isEnabled = dl.filmCadenceAvailable
+    filmCadenceBox.toolTip = NSLocalizedString("menu.decklink_film_cadence_tip",
+                                               value: "Lay 23.976 film onto the 59.94 field raster as broadcast does, three fields then two, generated on the card's clock rather than resampled from the window. Needs True Interlace, and the scheduled path rather than Low Latency, because the cadence has to be clocked by the card.",
+                                               comment: "")
+
     interlineBox.state = dl.interlineFilter ? .on : .off
     interlineBox.isEnabled = dl.selectedMode?.isInterlacedOrPsF ?? false
 
@@ -418,7 +429,20 @@ class DeckLinkPanelController: NSWindowController {
                                                  value: "\nraster %@, weaving %@",
                                                  comment: "raster type and whether weaving is on"),
                        raster, weaving ? "on" : "off")
-        let needed = mode.fps * (weaving ? 2.0 : 1.0)
+        // With the cadence running, a capture is a FILM frame, not a field, so the rate to judge it
+        // against is the source rate. Say so rather than reporting it short against a target that
+        // no longer applies.
+        let cadence = dl.cadenceEngaged
+        var needed = mode.fps * (weaving ? 2.0 : 1.0)
+        if cadence {
+          needed = mode.fps * 0.8   // four film frames per five output frames
+          text += NSLocalizedString("decklink.panel_cadence", value: "\nfilm cadence 2:3 engaged",
+                                    comment: "")
+        } else if dl.filmCadence && dl.filmCadenceAvailable {
+          text += NSLocalizedString("decklink.panel_cadence_idle",
+                                    value: "\nfilm cadence asked for, source is not 2/5 of the field rate",
+                                    comment: "")
+        }
         text += String(format: NSLocalizedString("decklink.panel_rate",
                                                  value: "\ndraw %.1f/s, capture %.1f/s of %.2f needed\nframes out %.1f/s of %.2f",
                                                  comment: "draw, capture and published frame rates"),
@@ -497,6 +521,11 @@ class DeckLinkPanelController: NSWindowController {
     guard let raw = sender.selectedItem?.representedObject as? Int,
           let order = DeckLinkFieldOrder(rawValue: raw) else { return }
     DeckLinkController.shared.setFieldOrder(order)
+    refresh()
+  }
+
+  @objc private func toggleFilmCadence(_ sender: NSButton) {
+    DeckLinkController.shared.setFilmCadence(sender.state == .on)
     refresh()
   }
 

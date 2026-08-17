@@ -48,6 +48,76 @@ final class DeckLinkVideoTap {
   /// 0 = waiting for the earlier field, 1 = waiting for the later one.
   private var fieldParity = 0
 
+  // MARK: - film cadence (2:3 pulldown)
+
+  /// Lay 23.976 film onto a 59.94-field raster as broadcast does, instead of resampling whatever
+  /// the window happens to be showing.
+  ///
+  /// The rates do not divide: 59.94 fields over 23.976 frames is exactly 2.5 fields per frame, so
+  /// each film frame has to occupy 3 fields then 2, forever. Sampling the display cannot produce
+  /// that reliably, because our sample instants, mpv's presentation grid and the card's field clock
+  /// are three different clocks; the cadence comes out approximately right but wanders, which is
+  /// uneven judder.
+  ///
+  /// So generate it instead. Field slot i shows source frame floor(i * 0.4), which lands the two
+  /// fields of the five output frames in a cycle as:
+  ///
+  ///     frame 0: (S0, S0)   clean
+  ///     frame 1: (S0, S1)   two film frames in one raster, as telecine sends
+  ///     frame 2: (S1, S2)   likewise
+  ///     frame 3: (S2, S2)   clean
+  ///     frame 4: (S3, S3)   clean
+  ///
+  /// which is 3:2:3:2 fields per film frame. Composition happens in `copyLatest`, on the card's own
+  /// clock, so the cadence on the wire is exactly regular however ragged our capture was.
+  ///
+  /// It is also the cheaper path: four film frames per five output frames is 23.976 readbacks a
+  /// second rather than 59.94, and the fields are assembled with the row copies the feeder was
+  /// doing anyway.
+  ///
+  /// Needs the scheduled output path, since Low Latency calls the provider when WE push rather than
+  /// when the card asks, and a cadence clocked by the producer is the thing this exists to avoid.
+  private var filmCadence = false
+  /// Frame rate mpv reports for the file. Zero when unknown.
+  private var sourceFrameRate: Double = 0
+  /// Field rate of the mode, so the cadence can check the source really is 2/5 of it.
+  private var fieldRate: Double = 0
+
+  /// Film frames, newest first. `incoming` is where a readback lands; the feeder promotes it.
+  private var incoming = [UInt8]()
+  private var current = [UInt8]()
+  private var previous = [UInt8]()
+  private var incomingIsNew = false
+  /// Which of the five output frames in the cycle comes next.
+  private var cadencePhase = 0
+  /// Output frames that take a fresh film frame. Phase 3 repeats, giving 4 pulls per 5 frames.
+  private static let cadencePulls = [true, true, true, false, true]
+
+  /// Whether the cadence can actually run: asked for, weaving, and a source that really is 2/5 of
+  /// the field rate. 23.976 into 59.94 qualifies; 59.94p does not, and forcing it would throw away
+  /// half the motion. Caller holds `lock`.
+  private var cadenceEngagedLocked: Bool {
+    guard filmCadence, weaveFields, sourceFrameRate > 0, fieldRate > 0 else { return false }
+    return abs(sourceFrameRate - fieldRate * 0.4) < fieldRate * 0.01
+  }
+
+  var cadenceEngaged: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return cadenceEngagedLocked
+  }
+
+  /// mpv's reported frame rate for the current file, which can change when the file does.
+  func updateSourceFrameRate(_ fps: Double) {
+    lock.lock()
+    if abs(fps - sourceFrameRate) > 0.001 {
+      sourceFrameRate = fps
+      updateSampleIntervalLocked()
+      nextSampleAt = 0        // the sample rate changed with it, so restart the phase
+    }
+    lock.unlock()
+  }
+
   /// Vertical low-pass before the lines are split into fields.
   ///
   /// A CRT draws alternate lines in alternate fields, so any detail that lives on a single line
@@ -103,27 +173,46 @@ final class DeckLinkVideoTap {
 
   func activate(width: Int, height: Int, fps: Double,
                 weaveFields: Bool = false, upperFieldFirst: Bool = true,
-                interlineFilter: Bool = false) {
+                interlineFilter: Bool = false,
+                filmCadence: Bool = false, sourceFrameRate: Double = 0) {
     lock.lock()
     targetWidth = width
     targetHeight = height
     self.weaveFields = weaveFields
     self.upperFieldFirst = upperFieldFirst
     self.interlineFilter = interlineFilter
+    self.filmCadence = filmCadence
+    self.sourceFrameRate = sourceFrameRate
+    fieldRate = weaveFields ? fps * 2.0 : fps
     fieldParity = 0
-    // Sample at the FIELD rate when weaving, since each field is its own moment. `fps` is the frame
-    // rate the card reports, so 1080i59.94 arrives here as 29.97 and must be captured at 59.94.
-    let sampleRate = weaveFields ? fps * 2.0 : fps
-    sampleInterval = sampleRate > 0 ? 1.0 / sampleRate : 0
+    cadencePhase = 0
+    incomingIsNew = false
     working = [UInt8](repeating: 0, count: width * height * 4)
     published = [UInt8](repeating: 0, count: width * height * 4)
+    if filmCadence {
+      // Three film frames in flight: one being read back, and the two a dirty output frame needs.
+      incoming = [UInt8](repeating: 0, count: width * height * 4)
+      current = [UInt8](repeating: 0, count: width * height * 4)
+      previous = [UInt8](repeating: 0, count: width * height * 4)
+    } else {
+      incoming = []; current = []; previous = []
+    }
     hasFrame = false
     frameComplete = !weaveFields
     capturedFrames = 0
     publishedFrames = 0
     hookCalls = 0
     nextSampleAt = 0
+    updateSampleIntervalLocked()
     lock.unlock()
+  }
+
+  /// How often to read back. The cadence wants ONE sample per film frame, since it builds the
+  /// fields itself; weaving without it wants one per field; anything else one per frame.
+  /// Caller holds `lock`.
+  private func updateSampleIntervalLocked() {
+    let rate = cadenceEngagedLocked ? sourceFrameRate : fieldRate
+    sampleInterval = rate > 0 ? 1.0 / rate : 0
   }
 
   /// Whether this draw is the one to sample, keeping the long-run rate at `sampleInterval`.
@@ -197,6 +286,28 @@ final class DeckLinkVideoTap {
   /// Caller holds `lock`.
   private func store(from src: UnsafeRawPointer, width w: Int, height h: Int) {
     let rowBytes = w * 4
+
+    // The cadence assembles fields itself, on the card's clock, so a capture is simply the next
+    // film frame. Filter here rather than per field: it is the same work over four fifths as many
+    // frames.
+    if cadenceEngagedLocked, incoming.count == rowBytes * h {
+      incoming.withUnsafeMutableBytes { raw in
+        guard let dstBase = raw.baseAddress else { return }
+        if interlineFilter {
+          let srcWords = src.assumingMemoryBound(to: UInt32.self)
+          let dstWords = dstBase.assumingMemoryBound(to: UInt32.self)
+          for y in 0..<h { filteredRow(srcWords, dstWords.advanced(by: y * w), width: w, y: y, height: h) }
+        } else {
+          memcpy(dstBase, src, rowBytes * h)
+        }
+      }
+      incomingIsNew = true
+      hasFrame = true
+      frameComplete = true
+      capturedFrames += 1
+      return
+    }
+
     working.withUnsafeMutableBytes { raw in
       guard let dstBase = raw.baseAddress else { return }
       let srcWords = src.assumingMemoryBound(to: UInt32.self)
@@ -524,14 +635,66 @@ final class DeckLinkVideoTap {
 
   // MARK: - consume (DeckLink thread)
 
+  /// Build one output frame of the 2:3 cycle straight into the feeder's buffer.
+  ///
+  /// Called once per output frame, from the card's completion thread, which is why the cadence is
+  /// regular: the phase advances on the card's clock rather than on ours. Phases 1 and 2 take their
+  /// first field from the PREVIOUS film frame, which is what puts two film frames in one raster
+  /// exactly twice in five, as telecine does. Everything else shows one frame in both fields.
+  ///
+  /// No more row copies than a plain frame needs, so the cadence costs nothing here.
+  /// Caller holds `lock`.
+  private func composeCadenceFrame(into destination: UnsafeMutableRawPointer,
+                                   width: Int, height: Int, stride: Int) {
+    let phase = cadencePhase
+    cadencePhase = (cadencePhase + 1) % Self.cadencePulls.count
+
+    // Promote a film frame, if the cycle wants one and capture has produced one. If it has not,
+    // hold the cycle where it is rather than advancing onto a frame that is not there: that shows
+    // as one film frame held a beat longer, which is what a projector would do, instead of a torn
+    // cadence. Swaps only, so nothing here copies a frame.
+    if Self.cadencePulls[phase], incomingIsNew {
+      swap(&previous, &current)
+      swap(&current, &incoming)
+      incomingIsNew = false
+    }
+
+    let rowBytes = width * 4
+    // The earlier moment has to land in the field the card transmits first.
+    let firstStart = upperFieldFirst ? 0 : 1
+    let firstIsPrevious = (phase == 1 || phase == 2)
+    let firstSource = firstIsPrevious ? previous : current
+
+    func blit(_ source: [UInt8], startingAt start: Int) {
+      guard source.count == rowBytes * height else { return }
+      source.withUnsafeBytes { raw in
+        guard let base = raw.baseAddress else { return }
+        var y = start
+        while y < height {
+          memcpy(destination.advanced(by: y * stride), base.advanced(by: y * rowBytes), rowBytes)
+          y += 2
+        }
+      }
+    }
+    blit(firstSource, startingAt: firstStart)
+    blit(current, startingAt: 1 - firstStart)
+  }
+
   /// Copy the most recent captured frame into the feeder's buffer.
   /// Returns false when nothing has been captured yet, which tells the feeder to repeat.
   func copyLatest(into destination: UnsafeMutableRawPointer,
                   width: Int, height: Int, stride: Int) -> Bool {
     lock.lock()
     defer { lock.unlock() }
-    guard hasFrame, width == targetWidth, height == targetHeight,
-          published.count == width * height * 4 else { return false }
+    guard hasFrame, width == targetWidth, height == targetHeight else { return false }
+
+    if cadenceEngagedLocked, current.count == width * height * 4 {
+      composeCadenceFrame(into: destination, width: width, height: height, stride: stride)
+      publishedFrames += 1
+      return true
+    }
+
+    guard published.count == width * height * 4 else { return false }
     let rowBytes = width * 4
     published.withUnsafeBytes { raw in
       guard let base = raw.baseAddress else { return }

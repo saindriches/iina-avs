@@ -28,6 +28,7 @@ private struct Keys {
   static let fieldMode = "decklink.fieldMode"
   static let fieldOrder = "decklink.fieldOrder"
   static let interlineFilter = "decklink.interlineFilter"
+  static let filmCadence = "decklink.filmCadence"
 }
 
 /// How the two fields of an interlaced frame are produced.
@@ -99,6 +100,23 @@ class DeckLinkController {
   /// Costs vertical resolution, so it is off unless asked for, and it is only offered on an
   /// interlaced raster.
   private(set) var interlineFilter: Bool
+
+  /// Lay 23.976 film onto the 59.94-field raster as broadcast does, rather than resampling the
+  /// window. See DeckLinkVideoTap's film cadence section for what it produces and why.
+  ///
+  /// Needs True Interlace and the scheduled path: Low Latency calls the frame provider when IINA
+  /// pushes rather than when the card asks, and a cadence clocked by the producer is exactly what
+  /// this exists to avoid.
+  private(set) var filmCadence: Bool
+
+  /// True while the cadence is not merely asked for but running, which needs a source that really
+  /// is 2/5 of the field rate. Surfaced so the panel can say so instead of leaving it ambiguous.
+  var cadenceEngaged: Bool { tap.cadenceEngaged }
+
+  /// Polls the routed player for its frame rate while output runs. On the main thread and once a
+  /// second: mpv property reads must not happen on the GL thread, and the answer only changes when
+  /// the file does.
+  private var sourceRateTimer: Timer?
 
   // MARK: - which player feeds the card
 
@@ -218,6 +236,7 @@ class DeckLinkController {
     fieldMode = DeckLinkFieldMode(rawValue: d.object(forKey: Keys.fieldMode) as? Int ?? 0) ?? .psf
     fieldOrder = DeckLinkFieldOrder(rawValue: d.object(forKey: Keys.fieldOrder) as? Int ?? 0) ?? .auto
     interlineFilter = d.bool(forKey: Keys.interlineFilter)
+    filmCadence = d.bool(forKey: Keys.filmCadence)
     updateActivityObservers()
     observeActivationForRestore()
     observeSleepWake()
@@ -333,6 +352,41 @@ class DeckLinkController {
     restartIfNeeded()
   }
 
+  func setFilmCadence(_ on: Bool) {
+    guard on != filmCadence else { return }
+    filmCadence = on
+    UserDefaults.standard.set(on, forKey: Keys.filmCadence)
+    restartIfNeeded()
+  }
+
+  /// Whether the cadence can be offered at all for the current setup.
+  var filmCadenceAvailable: Bool {
+    (selectedMode?.isInterlaced ?? false) && fieldMode == .trueInterlace && !lowLatency
+  }
+
+  /// Frame rate of the file the routed player is showing, or 0 when there is nothing to ask.
+  private func routedSourceFrameRate() -> Double {
+    guard let player = routedPlayer, let mpv = player.mpv else { return 0 }
+    let fps = mpv.getDouble(MPVProperty.containerFps)
+    return fps.isFinite && fps > 0 ? fps : 0
+  }
+
+  private func startSourceRateTimer() {
+    sourceRateTimer?.invalidate()
+    tap.updateSourceFrameRate(routedSourceFrameRate())
+    let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+      guard let self = self else { return }
+      self.tap.updateSourceFrameRate(self.routedSourceFrameRate())
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    sourceRateTimer = timer
+  }
+
+  private func stopSourceRateTimer() {
+    sourceRateTimer?.invalidate()
+    sourceRateTimer = nil
+  }
+
   func setLevelA(_ on: Bool) {
     guard on != levelA else { return }
     levelA = on
@@ -390,9 +444,13 @@ class DeckLinkController {
     // The filter is about an interlaced raster, PsF included, since a CRT scans alternate lines
     // either way. A progressive mode has nothing to twitter, so it never gets it.
     let filter = mode.isInterlacedOrPsF && interlineFilter
+    // The cadence needs the card to clock the consumer, so it is only offered off the low-latency
+    // path. Asking for it elsewhere leaves ordinary weaving rather than half-applying it.
+    let cadence = weave && filmCadence && !lowLatency
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
                  weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),
-                 interlineFilter: filter)
+                 interlineFilter: filter,
+                 filmCadence: cadence, sourceFrameRate: routedSourceFrameRate())
 
     var ok = false
     do {
@@ -408,6 +466,7 @@ class DeckLinkController {
       ok = true
       lastError = nil
       beginBackgroundActivity()
+      startSourceRateTimer()
     } catch {
       lastError = error.localizedDescription
       tap.deactivate()   // device never opened; nothing should keep capturing for it
@@ -424,6 +483,7 @@ class DeckLinkController {
 
   private func stopDevice() {
     endBackgroundActivity()
+    stopSourceRateTimer()
     guard output.isRunning else { return }
     // Stop the tap first so no capture races the device teardown.
     tap.deactivate()

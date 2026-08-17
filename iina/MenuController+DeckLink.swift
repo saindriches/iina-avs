@@ -312,6 +312,16 @@ extension MenuController {
                                           value: "Which field the card transmits first, and so which one carries the earlier moment. Auto follows the driver, which is right for a conforming chain. Backwards, motion advances two steps and falls back one at the field rate, which reads as a vibration on any pan.",
                                           comment: "")
 
+    let cadence = menu.addItem(withTitle: NSLocalizedString("menu.decklink_film_cadence",
+                                                            value: "Film Cadence (2:3 Pulldown)", comment: ""),
+                               action: #selector(menuDeckLinkToggleFilmCadence(_:)), keyEquivalent: "")
+    cadence.target = self
+    cadence.state = dl.filmCadence ? .on : .off
+    cadence.isEnabled = dl.filmCadenceAvailable
+    cadence.toolTip = NSLocalizedString("menu.decklink_film_cadence_tip",
+                                        value: "Lay 23.976 film onto the 59.94 field raster as broadcast does, three fields then two, generated on the card's clock rather than resampled from the window. Needs True Interlace, and the scheduled path rather than Low Latency, because the cadence has to be clocked by the card.",
+                                        comment: "")
+
     let twitter = menu.addItem(withTitle: NSLocalizedString("menu.decklink_interline",
                                                              value: "Interline Filter", comment: ""),
                                action: #selector(menuDeckLinkToggleInterlineFilter(_:)), keyEquivalent: "")
@@ -380,6 +390,10 @@ extension MenuController {
     guard let raw = sender.representedObject as? Int,
           let link = DeckLinkSDILink(rawValue: raw) else { return }
     DeckLinkController.shared.selectSDILink(link)
+  }
+
+  @objc func menuDeckLinkToggleFilmCadence(_ sender: NSMenuItem) {
+    DeckLinkController.shared.setFilmCadence(sender.state != .on)
   }
 
   @objc func menuDeckLinkSelectFieldOrder(_ sender: NSMenuItem) {
