@@ -30,6 +30,7 @@ private struct Keys {
   static let interlineFilter = "decklink.interlineFilter"
   static let filmCadence = "decklink.filmCadence"
   static let scaling = "decklink.scaling"
+  static let compensateAudio = "decklink.compensateAudio"
 }
 
 /// How the two fields of an interlaced frame are produced.
@@ -116,9 +117,11 @@ class DeckLinkController {
   /// Lay 23.976 film onto the 59.94-field raster as broadcast does, rather than resampling the
   /// window. See DeckLinkVideoTap's film cadence section for what it produces and why.
   ///
-  /// Needs True Interlace and the scheduled path: Low Latency calls the frame provider when IINA
-  /// pushes rather than when the card asks, and a cadence clocked by the producer is exactly what
-  /// this exists to avoid.
+  /// Needs True Interlace. It used to need the scheduled path as well, because Low Latency asked
+  /// for a frame whenever IINA pushed one, so the output rate was the SOURCE rate and a cadence
+  /// that must emit five frames for every four had nowhere to put the extra one. Low Latency is now
+  /// paced by the card's own clock, so both paths tick at the output rate and the cadence runs on
+  /// either.
   private(set) var filmCadence: Bool
 
   /// How a picture of a different shape is mapped onto the SDI raster.
@@ -138,6 +141,29 @@ class DeckLinkController {
 
   /// Frame rate of the file being shown, as the tap last saw it.
   var sourceFrameRate: Double { tap.sourceRate }
+
+  /// Frames sitting in the card, from the driver.
+  var bufferedFrames: Int { output.bufferedFrames }
+
+  /// How far behind the window the SDI picture is, in seconds.
+  ///
+  /// Part measured, part exact arithmetic, no guessing: the tap knows what it is holding, the
+  /// driver reports what the card is holding, and one more frame covers the one being scanned out.
+  /// Which is why the scheduled path reads an order of magnitude higher than Low Latency; that
+  /// queue is the whole difference between them.
+  var estimatedLatency: Double {
+    guard let mode = selectedMode, mode.fps > 0 else { return 0 }
+    return tap.pipelineDelay + (Double(output.bufferedFrames) + 1.0) / mode.fps
+  }
+
+  /// Delay the audio to match, so lip sync holds on the reference monitor rather than on the Mac.
+  ///
+  /// The picture reaches the SDI monitor later than it reaches the window, but the audio does not,
+  /// so anything watched on the monitor drifts by exactly the video latency. mpv's audio-delay is
+  /// the right lever; positive delays audio, which is the direction needed here.
+  private(set) var compensateAudio: Bool
+  /// What audio-delay was before we touched it, so it can be handed back untouched.
+  private var savedAudioDelay: Double?
 
   /// Polls the routed player for its frame rate while output runs. On the main thread and once a
   /// second: mpv property reads must not happen on the GL thread, and the answer only changes when
@@ -302,6 +328,7 @@ class DeckLinkController {
     interlineFilter = d.bool(forKey: Keys.interlineFilter)
     filmCadence = d.bool(forKey: Keys.filmCadence)
     scaling = DeckLinkScaling(rawValue: d.object(forKey: Keys.scaling) as? Int ?? 0) ?? .fit
+    compensateAudio = d.bool(forKey: Keys.compensateAudio)
     updateActivityObservers()
     observeActivationForRestore()
     observeSleepWake()
@@ -446,6 +473,36 @@ class DeckLinkController {
     notifyChanged()
   }
 
+  func setCompensateAudio(_ on: Bool) {
+    guard on != compensateAudio else { return }
+    compensateAudio = on
+    UserDefaults.standard.set(on, forKey: Keys.compensateAudio)
+    updateAudioCompensation()
+    notifyChanged()
+  }
+
+  /// Hold the audio delay at the current video latency, or put back what was there before.
+  ///
+  /// Driven from the same one second tick as the source rate, and for the same reason: mpv property
+  /// writes belong on the main thread, and the number moves slowly. Only rewritten when it has
+  /// moved more than 5 ms, so the user can still nudge audio-delay themselves without a timer
+  /// fighting them every second.
+  private func updateAudioCompensation() {
+    guard let player = routedPlayer, player.info.state.loaded, let mpv = player.mpv else { return }
+    guard compensateAudio, output.isRunning else {
+      if let saved = savedAudioDelay {
+        mpv.setDouble(MPVOption.Audio.audioDelay, saved)
+        savedAudioDelay = nil
+      }
+      return
+    }
+    if savedAudioDelay == nil { savedAudioDelay = mpv.getDouble(MPVOption.Audio.audioDelay) }
+    let target = estimatedLatency
+    if abs(mpv.getDouble(MPVOption.Audio.audioDelay) - target) > 0.005 {
+      mpv.setDouble(MPVOption.Audio.audioDelay, target)
+    }
+  }
+
   func setFilmCadence(_ on: Bool) {
     guard on != filmCadence else { return }
     filmCadence = on
@@ -455,7 +512,7 @@ class DeckLinkController {
 
   /// Whether the cadence can be offered at all for the current setup.
   var filmCadenceAvailable: Bool {
-    (selectedMode?.isInterlaced ?? false) && fieldMode == .trueInterlace && !lowLatency
+    (selectedMode?.isInterlaced ?? false) && fieldMode == .trueInterlace
   }
 
   /// Frame rate of the file the routed player is showing, or 0 when there is nothing to ask.
@@ -475,6 +532,7 @@ class DeckLinkController {
     let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
       guard let self = self else { return }
       self.tap.updateSourceFrameRate(self.routedSourceFrameRate())
+      self.updateAudioCompensation()
     }
     RunLoop.main.add(timer, forMode: .common)
     sourceRateTimer = timer
@@ -483,6 +541,7 @@ class DeckLinkController {
   private func stopSourceRateTimer() {
     sourceRateTimer?.invalidate()
     sourceRateTimer = nil
+    updateAudioCompensation()   // output is going away, so give the audio delay back
   }
 
   func setLevelA(_ on: Bool) {
@@ -575,7 +634,7 @@ class DeckLinkController {
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
                  weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),
                  interlineFilter: mode.isInterlacedOrPsF && interlineFilter,
-                 filmCadence: weave && filmCadence && !lowLatency,
+                 filmCadence: weave && filmCadence,
                  sourceFrameRate: routedSourceFrameRate())
   }
 

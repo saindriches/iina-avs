@@ -111,6 +111,9 @@ typedef BOOL (^DeckLinkFrameProvider)(void *buffer, NSInteger width, NSInteger h
 /// honest about whether playout is actually keeping up rather than just claiming it is.
 @property (nonatomic, readonly) NSInteger scheduledFrames;
 @property (nonatomic, readonly) NSInteger lateFrames;
+/// Frames the card is holding but has not shown yet, straight from the driver. The honest part of
+/// any latency figure: everything else upstream has to be reasoned about, this is measured.
+@property (nonatomic, readonly) NSInteger bufferedFrames;
 @property (nonatomic, readonly) NSInteger droppedFrames;
 /// How many times the scheduler had to jump forward because it had fallen behind the card. Each
 /// resync leaves a short hole in the schedule (the card holds its last frame), so a number that

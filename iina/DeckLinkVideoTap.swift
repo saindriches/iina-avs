@@ -75,8 +75,9 @@ final class DeckLinkVideoTap {
   /// second rather than 59.94, and the fields are assembled with the row copies the feeder was
   /// doing anyway.
   ///
-  /// Needs the scheduled output path, since Low Latency calls the provider when WE push rather than
-  /// when the card asks, and a cadence clocked by the producer is the thing this exists to avoid.
+  /// Needs a consumer that ticks at the OUTPUT rate, since the whole point is emitting more frames
+  /// than the source has. Both paths now do: the scheduled feeder is bounded by the card's
+  /// completions, and the sync displayer follows the card's hardware reference clock.
   private var filmCadence = false
   /// Frame rate mpv reports for the file. Zero when unknown.
   private var sourceFrameRate: Double = 0
@@ -164,6 +165,23 @@ final class DeckLinkVideoTap {
   private var weaveStarvedLocked: Bool {
     guard weaveFields, !cadenceEngagedLocked, sourceFrameRate > 0, fieldRate > 0 else { return false }
     return sourceFrameRate < fieldRate * 0.9
+  }
+
+  /// How long a captured picture waits inside the tap before the card can be handed it.
+  ///
+  /// Two contributions, both exact rather than guessed. The PBO ping-pong hides its GPU stall by
+  /// mapping the PREVIOUS readback, which is one whole capture interval by construction. The
+  /// cadence queue holds whatever it holds, at the source rate. Everything downstream of here is
+  /// the card's and is measured from the driver.
+  var pipelineDelay: Double {
+    lock.lock()
+    defer { lock.unlock() }
+    var delay = 0.0
+    if !immediateReadback { delay += sampleInterval }
+    if cadenceEngagedLocked, sourceFrameRate > 0 {
+      delay += Double(filmReady.count) / sourceFrameRate
+    }
+    return delay
   }
 
   /// Source frame rate as last reported, for the panel to judge the capture rate against.

@@ -516,19 +516,31 @@ private:
 
 namespace {
 
-/// Immediate-display path: on each notify, pull the newest frame, pack it, and hand it to
-/// DisplayVideoFrameSync, which shows it at the card's next output refresh. No scheduler, no queue,
-/// no preroll, so latency is pack time plus refresh alignment.
+/// Immediate-display path: once per output frame, pull the newest picture, pack it, and hand it to
+/// DisplayVideoFrameSync, which shows it at the card's next refresh. No scheduler, no queue, no
+/// preroll, so latency is pack time plus refresh alignment.
 ///
-/// The card still clocks the signal here. What is given up is the queue, and with it the tolerance
-/// for a producer whose rate and phase are not locked to the card: a late or early frame becomes a
-/// duplicate or a skip instead of being absorbed.
+/// Paced by the CARD, not by the producer. This used to display on each notify from the tap, which
+/// meant the output frame rate was whatever the capture rate happened to be. That is fine for
+/// latest-frame-wins monitoring, but it makes a pulldown cadence impossible: 2:3 has to emit five
+/// output frames for every four film frames, so it must be driven by something that ticks at the
+/// output rate rather than at the source rate. IDeckLinkOutput::GetHardwareReferenceClock reports
+/// the card's own time, how far into the current frame it is, and the ticks per frame, which is
+/// exactly that clock, and it costs nothing: the display was already waiting for a refresh.
+///
+/// Targeting a frame INDEX rather than sleeping a duration is what makes it robust. The phase is
+/// re-read every iteration, so it cannot drift, and it behaves the same whether
+/// DisplayVideoFrameSync returns immediately or blocks until the frame is on air. It also cannot
+/// display twice against one boundary, which a duration-based sleep can when the call returns just
+/// short of one.
 class SyncDisplayer {
 public:
   SyncDisplayer(IDeckLinkOutput *out, DeckLinkFrameProvider provider,
                 long w, long h, BMDPixelFormat fmt, DeckLinkVideoRange range,
+                BMDTimeValue frameDuration, BMDTimeScale timeScale,
                 std::vector<IDeckLinkMutableVideoFrame *> pool)
       : out_(out), provider_(provider), w_(w), h_(h), fmt_(fmt), range_(range),
+        frameDuration_(frameDuration), timeScale_(timeScale),
         pool_(std::move(pool)), srcStride_(w * 4) {
     src_.resize(size_t(srcStride_) * size_t(h), 0);
     thread_ = std::thread([this] { loop(); });
@@ -551,13 +563,9 @@ public:
 
 private:
   void loop() {
+    BMDTimeValue lastIndex = -1;
     while (running_.load()) {
-      {
-        std::unique_lock<std::mutex> lk(m_);
-        cv_.wait(lk, [this] { return pending_ || !running_.load(); });
-        if (!running_.load()) return;
-        pending_ = false;   // coalesce: bursts collapse into one display of the newest frame
-      }
+      if (!waitForNextOutputFrame(lastIndex)) return;
 
       bool filled = false;
       if (provider_) {
@@ -579,11 +587,46 @@ private:
     }
   }
 
+  /// Sleep until shortly before the card's next output frame boundary. False when stopping.
+  ///
+  /// Each pass claims the frame index after the one last claimed, so exactly one display is made
+  /// per output frame however long the work took. Falling behind takes the next index rather than
+  /// trying to catch up, since catching up would mean a burst of displays into frames that have
+  /// already gone. Waking a quarter frame early leaves room to pack before the boundary.
+  bool waitForNextOutputFrame(BMDTimeValue &lastIndex) {
+    std::chrono::nanoseconds wait(0);
+    BMDTimeValue hw = 0, inFrame = 0, ticks = 0;
+    if (timeScale_ > 0 &&
+        out_->GetHardwareReferenceClock(timeScale_, &hw, &inFrame, &ticks) == S_OK && ticks > 0) {
+      const BMDTimeValue index = hw / ticks;
+      BMDTimeValue target = (lastIndex < 0) ? index + 1 : lastIndex + 1;
+      if (target <= index) target = index + 1;
+      lastIndex = target;
+      const BMDTimeValue due = target * ticks - ticks / 4;
+      if (due > hw) wait = std::chrono::nanoseconds(((due - hw) * 1000000000LL) / timeScale_);
+    } else {
+      // No clock to follow (card stopped, or the call refused): fall back to one frame of sleep so
+      // the loop still paces itself instead of spinning.
+      wait = std::chrono::nanoseconds(frameDuration_ && timeScale_
+                                          ? (1000000000LL * frameDuration_) / timeScale_
+                                          : 16000000LL);
+    }
+    if (wait.count() <= 0) return running_.load();
+    // Waiting on the condition variable rather than sleeping, so stop() is still prompt. A notify
+    // from the tap wakes it, finds the predicate false and waits out the remainder, which leaves
+    // the pacing intact.
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait_for(lk, wait, [this] { return !running_.load(); });
+    return running_.load();
+  }
+
   IDeckLinkOutput *out_;
   DeckLinkFrameProvider provider_;
   long w_, h_;
   BMDPixelFormat fmt_;
   DeckLinkVideoRange range_;
+  BMDTimeValue frameDuration_ = 0;
+  BMDTimeScale timeScale_ = 0;
   std::vector<IDeckLinkMutableVideoFrame *> pool_;
   long srcStride_;
   std::vector<uint8_t> src_;
@@ -828,7 +871,7 @@ private:
     // Immediate display: no scheduler, no completion callback, no preroll. Three rotating frames
     // are plenty; DisplayVideoFrameSync replaces the on-air frame at the next refresh.
     std::vector<IDeckLinkMutableVideoFrame *> syncPool(pool.begin(), pool.begin() + 3);
-    _sync = new SyncDisplayer(out, provider, w, h, bmdFmt, range, syncPool);
+    _sync = new SyncDisplayer(out, provider, w, h, bmdFmt, range, frameDuration, timeScale, syncPool);
     mode->Release();
     _running = YES;
     return YES;
@@ -904,6 +947,13 @@ private:
   if (_sync) _sync->notify();
 }
 - (NSInteger)lateFrames { return _feeder ? _feeder->late() : _lateFrames; }
+
+- (NSInteger)bufferedFrames {
+  if (!_output || !_running) return 0;
+  uint32_t count = 0;
+  if (_output->GetBufferedVideoFrameCount(&count) != S_OK) return 0;
+  return (NSInteger)count;
+}
 - (NSInteger)droppedFrames { return _feeder ? _feeder->dropped() : _droppedFrames; }
 - (NSInteger)resyncCount { return _feeder ? _feeder->resyncs() : _resyncCount; }
 - (NSInteger)repeatCount { return _feeder ? _feeder->repeats() : _repeatCount; }

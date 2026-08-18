@@ -57,6 +57,7 @@ class DeckLinkPanelController: NSWindowController {
   private var levelABox: NSButton!
   private var nativeRenderBox: NSButton!
   private var lowLatencyBox: NSButton!
+  private var compensateAudioBox: NSButton!
   private var releaseBox: NSButton!
   private var toggleButton: NSButton!
   private var statusLabel: NSTextField!
@@ -149,6 +150,12 @@ class DeckLinkPanelController: NSWindowController {
     lowLatencyBox = addCheck(to: stack, NSLocalizedString("menu.decklink_low_latency",
                                                           value: "Low Latency Mode", comment: ""),
                              action: #selector(toggleLowLatency(_:)))
+    compensateAudioBox = addCheck(to: stack, NSLocalizedString("menu.decklink_compensate_audio",
+                                                               value: "Delay Audio to Match", comment: ""),
+                                  action: #selector(toggleCompensateAudio(_:)))
+    compensateAudioBox.toolTip = NSLocalizedString("menu.decklink_compensate_audio_tip",
+                                                   value: "The SDI picture reaches the monitor later than the window does, but the audio does not, so anything watched on the monitor drifts by exactly that. This holds mpv's audio delay at the measured video latency. It is put back as it was when output stops.",
+                                                   comment: "")
     releaseBox = addCheck(to: stack, NSLocalizedString("menu.decklink_release",
                                                        value: "Release Device When Inactive", comment: ""),
                           action: #selector(toggleRelease(_:)))
@@ -405,7 +412,7 @@ class DeckLinkPanelController: NSWindowController {
     filmCadenceBox.state = dl.filmCadence ? .on : .off
     filmCadenceBox.isEnabled = dl.filmCadenceAvailable
     filmCadenceBox.toolTip = NSLocalizedString("menu.decklink_film_cadence_tip",
-                                               value: "Spread a source slower than the field rate across the fields, generated on the card's clock rather than resampled from the window. 23.976 film into 59.94 fields gives the 2:3 of telecine, 50p gives 5:6, 30p a clean two fields each. Needs True Interlace, and the scheduled path rather than Low Latency, because the cadence has to be clocked by the card.",
+                                               value: "Spread a source slower than the field rate across the fields, generated on the card's clock rather than resampled from the window. 23.976 film into 59.94 fields gives the 2:3 of telecine, 50p gives 5:6, 30p a clean two fields each. Needs True Interlace. Works on either latency path, since both are now paced by the card.",
                                                comment: "")
 
     interlineBox.state = dl.interlineFilter ? .on : .off
@@ -420,7 +427,9 @@ class DeckLinkPanelController: NSWindowController {
     lowLatencyBox.state = dl.lowLatency ? .on : .off
     releaseBox.state = dl.releaseWhenInactive ? .on : .off
     testPatternBox.state = dl.testPattern ? .on : .off
-    [nativeRenderBox, lowLatencyBox, releaseBox, testPatternBox].forEach { $0?.isEnabled = true }
+    compensateAudioBox.state = dl.compensateAudio ? .on : .off
+    [nativeRenderBox, lowLatencyBox, releaseBox, testPatternBox,
+     compensateAudioBox].forEach { $0?.isEnabled = true }
 
     window?.setContentSize(NSSize(width: 380, height: fittingHeight()))
   }
@@ -517,6 +526,13 @@ class DeckLinkPanelController: NSWindowController {
     // -- rate, in pipeline order, each against its target.
     lines.append(String(format: "rate    draw %.1f  capture %.1f/%.2f  out %.1f/%.2f",
                         drawsPerSecond, capturesPerSecond, needed, framesPerSecond, mode.fps))
+
+    // -- delay. Where the picture on the monitor sits relative to the window, and what the audio
+    // is being shifted by to match it.
+    var delay = String(format: "delay   %.0f ms, %ld in card",
+                       dl.estimatedLatency * 1000.0, dl.bufferedFrames)
+    if dl.compensateAudio { delay += ", audio matched" }
+    lines.append(delay)
 
     // -- count. Scheduled is context; the rest should all be zero.
     lines.append(String(format: "count   sent %ld, late %ld, dropped %ld, repeat %ld, resync %ld",
@@ -621,6 +637,11 @@ class DeckLinkPanelController: NSWindowController {
 
   @objc private func toggleLowLatency(_ sender: NSButton) {
     DeckLinkController.shared.lowLatency = (sender.state == .on)
+    refresh()
+  }
+
+  @objc private func toggleCompensateAudio(_ sender: NSButton) {
+    DeckLinkController.shared.setCompensateAudio(sender.state == .on)
     refresh()
   }
 
