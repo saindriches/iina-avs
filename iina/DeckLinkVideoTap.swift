@@ -158,10 +158,10 @@ final class DeckLinkVideoTap {
   /// timing. There are only 24 distinct moments a second in the source, so no amount of sampling
   /// can invent field-rate motion.
   ///
-  /// The honest answer is whole frames: both fields from one instant, which is PsF. The card still
-  /// repeats what it is not given, but each frame it shows is at least internally consistent.
-  /// 2:3 is better where it applies, and takes priority; this is the fallback for everything else,
-  /// 30p on a 60 field raster being the common one. Caller holds `lock`.
+  /// The answer without the cadence is whole frames at the output rate: both fields one instant,
+  /// which is PsF, sampled so that the drop or repeat is regular. It is strictly worse than the
+  /// cadence, which keeps every source moment by spreading them over the fields, so it only applies
+  /// when the cadence is off. Caller holds `lock`.
   private var weaveStarvedLocked: Bool {
     guard weaveFields, !cadenceEngagedLocked, sourceFrameRate > 0, fieldRate > 0 else { return false }
     return sourceFrameRate < fieldRate * 0.9
@@ -405,9 +405,23 @@ final class DeckLinkVideoTap {
   /// fields itself; weaving without it wants one per field; anything else one per frame.
   /// Caller holds `lock`.
   private func updateSampleIntervalLocked() {
-    // Never sample faster than the source changes: with the cadence, or when weaving has fallen
-    // back to whole frames, the extra readbacks would all be of the same picture.
-    let rate = (cadenceEngagedLocked || weaveStarvedLocked) ? sourceFrameRate : fieldRate
+    let rate: Double
+    if cadenceEngagedLocked {
+      // One capture per source frame: the cadence spreads them across the fields itself.
+      rate = sourceFrameRate
+    } else if weaveStarvedLocked {
+      // Whole frames, sampled at the OUTPUT rate rather than the source's.
+      //
+      // Sampling at the source rate was wrong in both directions. Above the output rate it handed
+      // the card more frames than it could show, so which ones survived was down to whenever the
+      // card happened to ask: 50p produced 50 published frames a second at a card taking 29.97, and
+      // the twenty that went missing were an arbitrary twenty. Below it, the card was left to
+      // repeat whatever it still had. Sampling at the output rate makes the drop or the repeat
+      // regular, which is the ordinary frame-rate conversion this case should have been doing.
+      rate = fieldRate / 2.0
+    } else {
+      rate = fieldRate
+    }
     sampleInterval = rate > 0 ? 1.0 / rate : 0
   }
 

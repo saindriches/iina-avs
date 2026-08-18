@@ -326,7 +326,10 @@ class DeckLinkController {
     fieldMode = DeckLinkFieldMode(rawValue: d.object(forKey: Keys.fieldMode) as? Int ?? 0) ?? .psf
     fieldOrder = DeckLinkFieldOrder(rawValue: d.object(forKey: Keys.fieldOrder) as? Int ?? 0) ?? .auto
     interlineFilter = d.bool(forKey: Keys.interlineFilter)
-    filmCadence = d.bool(forKey: Keys.filmCadence)
+    // On unless explicitly turned off. It used to be a film-only trick worth opting into; now it is
+    // simply the right way to put any source onto a field raster, and the alternative throws away
+    // either moments or motion.
+    filmCadence = d.object(forKey: Keys.filmCadence) as? Bool ?? true
     scaling = DeckLinkScaling(rawValue: d.object(forKey: Keys.scaling) as? Int ?? 0) ?? .fit
     compensateAudio = d.bool(forKey: Keys.compensateAudio)
     updateActivityObservers()

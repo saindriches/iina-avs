@@ -513,7 +513,13 @@ class DeckLinkPanelController: NSWindowController {
       // Only as many distinct moments a second as the source has frames, so field-rate motion
       // cannot be made however it is sampled.
       needed = mode.fps
-      build = "whole frames, source below the field rate"
+      // Two different thresholds, and saying "too slow" for both was wrong. Weaving needs a moment
+      // per FIELD, which is what this source cannot supply. Whether frames have to REPEAT is a
+      // question about the frame rate, half of that, and a 50p source is well above it: those
+      // frames are being dropped, not repeated, and calling that too slow was misleading.
+      let short = dl.sourceFrameRate < mode.fps
+      build = String(format: "whole frames %.2f from %.2f, %@",
+                     mode.fps, dl.sourceFrameRate, short ? "repeating" : "dropping")
     } else if weaving {
       build = "field-rate interlace"
     } else if mode.isInterlacedOrPsF {
