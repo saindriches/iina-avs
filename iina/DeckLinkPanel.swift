@@ -62,7 +62,7 @@ class DeckLinkPanelController: NSWindowController {
   private var statusLabel: NSTextField!
 
   private init() {
-    let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 10),
+    let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 10),
                         styleMask: [.titled, .closable, .utilityWindow, .hudWindow],
                         backing: .buffered, defer: false)
     panel.title = NSLocalizedString("decklink.panel_title", value: "DeckLink Output",
@@ -99,7 +99,7 @@ class DeckLinkPanelController: NSWindowController {
     statusLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
     statusLabel.textColor = .secondaryLabelColor
     statusLabel.lineBreakMode = .byWordWrapping
-    statusLabel.preferredMaxLayoutWidth = 300
+    statusLabel.preferredMaxLayoutWidth = 344
     stack.addArrangedSubview(statusLabel)
 
     stack.addArrangedSubview(separator())
@@ -134,7 +134,7 @@ class DeckLinkPanelController: NSWindowController {
                              action: #selector(selectFieldOrder(_:)))
 
     filmCadenceBox = addCheck(to: stack, NSLocalizedString("menu.decklink_film_cadence",
-                                                            value: "Film Cadence (2:3 Pulldown)", comment: ""),
+                                                            value: "Pulldown Cadence", comment: ""),
                               action: #selector(toggleFilmCadence(_:)))
 
     interlineBox = addCheck(to: stack, NSLocalizedString("menu.decklink_interline",
@@ -196,7 +196,7 @@ class DeckLinkPanelController: NSWindowController {
     popUp.action = action
     popUp.autoenablesItems = false
     popUp.translatesAutoresizingMaskIntoConstraints = false
-    popUp.widthAnchor.constraint(equalToConstant: 300).isActive = true
+    popUp.widthAnchor.constraint(equalToConstant: 344).isActive = true
     stack.addArrangedSubview(popUp)
     return popUp
   }
@@ -265,7 +265,7 @@ class DeckLinkPanelController: NSWindowController {
     guard dl.isDriverAvailable else {
       [toggleButton, devicePopUp, modePopUp, formatPopUp, rangePopUp, linkPopUp,
        use444Box, levelABox, nativeRenderBox, lowLatencyBox, releaseBox].forEach { $0?.isEnabled = false }
-      window?.setContentSize(NSSize(width: 340, height: fittingHeight()))
+      window?.setContentSize(NSSize(width: 380, height: fittingHeight()))
       return
     }
 
@@ -405,7 +405,7 @@ class DeckLinkPanelController: NSWindowController {
     filmCadenceBox.state = dl.filmCadence ? .on : .off
     filmCadenceBox.isEnabled = dl.filmCadenceAvailable
     filmCadenceBox.toolTip = NSLocalizedString("menu.decklink_film_cadence_tip",
-                                               value: "Lay 23.976 film onto the 59.94 field raster as broadcast does, three fields then two, generated on the card's clock rather than resampled from the window. Needs True Interlace, and the scheduled path rather than Low Latency, because the cadence has to be clocked by the card.",
+                                               value: "Spread a source slower than the field rate across the fields, generated on the card's clock rather than resampled from the window. 23.976 film into 59.94 fields gives the 2:3 of telecine, 50p gives 5:6, 30p a clean two fields each. Needs True Interlace, and the scheduled path rather than Low Latency, because the cadence has to be clocked by the card.",
                                                comment: "")
 
     interlineBox.state = dl.interlineFilter ? .on : .off
@@ -422,7 +422,7 @@ class DeckLinkPanelController: NSWindowController {
     testPatternBox.state = dl.testPattern ? .on : .off
     [nativeRenderBox, lowLatencyBox, releaseBox, testPatternBox].forEach { $0?.isEnabled = true }
 
-    window?.setContentSize(NSSize(width: 340, height: fittingHeight()))
+    window?.setContentSize(NSSize(width: 380, height: fittingHeight()))
   }
 
   /// Just the counters, cheap enough to run every second.
@@ -444,62 +444,7 @@ class DeckLinkPanelController: NSWindowController {
     if let error = dl.lastError {
       statusLabel.stringValue = error
     } else if dl.isRunning {
-      var text = String(format: NSLocalizedString("menu.decklink_status", value: "Scheduled %ld, late %ld, dropped %ld, captured %ld, resync %ld, repeat %ld", comment: ""),
-                        dl.scheduledFrames, dl.lateFrames, dl.droppedFrames,
-                        dl.capturedFrames, dl.resyncCount, dl.repeatCount)
-      // The rate, and what it has to be. Interlace weaving needs a sample per FIELD, so the target
-      // is twice the mode's frame rate; anything short of it means frames go out as PsF seeds
-      // rather than as two distinct moments.
-      if let mode = dl.selectedMode {
-        // Say what the raster actually is and whether weaving armed. `isInterlaced` comes from the
-        // driver's field dominance, and if it does not report upper or lower first then weaving
-        // never engages however the Fields row is set, which looks identical to being too slow.
-        let raster: String
-        if mode.isInterlaced {
-          // The EFFECTIVE order, not the driver's. Reporting the driver's meant the line could
-          // never say "lower first", so an override could not be confirmed from the panel.
-          let upper = dl.upperFieldFirst(for: mode)
-          let overridden = dl.fieldOrder != .auto ? ", forced" : ""
-          raster = "interlaced, \(upper ? "upper" : "lower") first\(overridden)"
-        } else if mode.isInterlacedOrPsF {
-          raster = "PsF"
-        } else {
-          raster = "progressive"
-        }
-        let weaving = mode.isInterlaced && dl.fieldMode == .trueInterlace
-        text += String(format: NSLocalizedString("decklink.panel_raster",
-                                                 value: "\nraster %@, weaving %@",
-                                                 comment: "raster type and whether weaving is on"),
-                       raster, weaving ? "on" : "off")
-        // With the cadence running, a capture is a FILM frame, not a field, so the rate to judge it
-        // against is the source rate. Say so rather than reporting it short against a target that
-        // no longer applies.
-        let cadence = dl.cadenceEngaged
-        var needed = mode.fps * (weaving ? 2.0 : 1.0)
-        if cadence {
-          needed = mode.fps * 0.8   // four film frames per five output frames
-          text += String(format: NSLocalizedString("decklink.panel_cadence",
-                                                  value: "\nfilm cadence 2:3 engaged, %ld holds",
-                                                  comment: ""), dl.cadenceHolds)
-        } else if dl.filmCadence && dl.filmCadenceAvailable {
-          text += NSLocalizedString("decklink.panel_cadence_idle",
-                                    value: "\nfilm cadence asked for, source is not 2/5 of the field rate",
-                                    comment: "")
-        } else if dl.weaveStarved {
-          // There are only as many distinct moments a second as the source has frames, so a slower
-          // source cannot make field-rate motion however it is sampled. Whole frames is the honest
-          // answer, and the rate to judge captures against becomes the source's.
-          needed = mode.fps
-          text += NSLocalizedString("decklink.panel_starved",
-                                    value: "\nsource too slow for field-rate motion, sending whole frames",
-                                    comment: "")
-        }
-        text += String(format: NSLocalizedString("decklink.panel_rate",
-                                                 value: "\ndraw %.1f/s, capture %.1f/s of %.2f needed\nframes out %.1f/s of %.2f",
-                                                 comment: "draw, capture and published frame rates"),
-                       drawsPerSecond, capturesPerSecond, needed, framesPerSecond, mode.fps)
-      }
-      statusLabel.stringValue = text
+      statusLabel.stringValue = runningStatus(dl)
     } else if !dl.isDriverAvailable {
       statusLabel.stringValue = NSLocalizedString("menu.decklink_no_driver",
                                                   value: "Blackmagic Desktop Video not installed",
@@ -511,6 +456,73 @@ class DeckLinkPanelController: NSWindowController {
       statusLabel.stringValue = NSLocalizedString("decklink.panel_idle", value: "Output stopped",
                                                   comment: "DeckLink idle status")
     }
+  }
+
+  /// Four labelled lines, in the order the picture actually travels.
+  ///
+  /// signal  what the card is being handed, as opposed to what was asked for
+  /// build   how the fields are being made, which is the setting that most often is not what
+  ///         the checkbox suggests
+  /// rate    the pipeline, left to right, each stage against what it has to be
+  /// count   cumulative totals, and only the ones that mean something is wrong
+  ///
+  /// Every rate carries its target, because a bare number cannot say whether it is healthy, and
+  /// grouping them left to right shows WHERE a shortfall starts rather than only that there is one.
+  private func runningStatus(_ dl: DeckLinkController) -> String {
+    guard let mode = dl.selectedMode else {
+      return String(format: "count   sent %ld, late %ld, dropped %ld",
+                    dl.scheduledFrames, dl.lateFrames, dl.droppedFrames)
+    }
+
+    // -- signal. `isInterlaced` comes from the driver's field dominance; if it reports neither
+    // upper nor lower first then weaving never engages however the Fields row is set, which from
+    // the outside looks identical to being too slow. The order shown is the EFFECTIVE one.
+    let weaving = mode.isInterlaced && dl.fieldMode == .trueInterlace
+    var raster: String
+    if mode.isInterlaced {
+      raster = "interlaced, \(dl.upperFieldFirst(for: mode) ? "upper" : "lower") first"
+      if dl.fieldOrder != .auto { raster += " (forced)" }
+    } else if mode.isInterlacedOrPsF {
+      raster = "PsF"
+    } else {
+      raster = "progressive"
+    }
+    // Deliberately NOT the mode name or size: the Video Mode row directly below already says both,
+    // and repeating them was what pushed this line onto a second row.
+    var lines = ["signal  " + raster]
+
+    // -- build, and the capture rate the chosen scheme implies.
+    let fieldRate = mode.fps * 2.0
+    var needed = weaving ? fieldRate : mode.fps
+    let build: String
+    if dl.cadenceEngaged {
+      // One capture per SOURCE frame: the cadence builds the fields itself.
+      needed = dl.sourceFrameRate
+      build = String(format: "cadence %.2f fps into %.2f fields, %ld holds",
+                     dl.sourceFrameRate, fieldRate, dl.cadenceHolds)
+    } else if dl.weaveStarved {
+      // Only as many distinct moments a second as the source has frames, so field-rate motion
+      // cannot be made however it is sampled.
+      needed = mode.fps
+      build = "whole frames, source below the field rate"
+    } else if weaving {
+      build = "field-rate interlace"
+    } else if mode.isInterlacedOrPsF {
+      build = "whole frames (PsF)"
+    } else {
+      build = "progressive"
+    }
+    lines.append("build   " + build + (dl.interlineFilter && mode.isInterlacedOrPsF ? ", interline filter" : ""))
+
+    // -- rate, in pipeline order, each against its target.
+    lines.append(String(format: "rate    draw %.1f  capture %.1f/%.2f  out %.1f/%.2f",
+                        drawsPerSecond, capturesPerSecond, needed, framesPerSecond, mode.fps))
+
+    // -- count. Scheduled is context; the rest should all be zero.
+    lines.append(String(format: "count   sent %ld, late %ld, dropped %ld, repeat %ld, resync %ld",
+                        dl.scheduledFrames, dl.lateFrames, dl.droppedFrames,
+                        dl.repeatCount, dl.resyncCount))
+    return lines.joined(separator: "\n")
   }
 
   private func fittingHeight() -> CGFloat {

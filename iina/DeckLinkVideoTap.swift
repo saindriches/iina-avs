@@ -100,17 +100,47 @@ final class DeckLinkVideoTap {
   /// Times the cycle wanted a film frame and had none. Should sit at zero: anything else means
   /// capture is not keeping up with the card and the cadence is being held rather than run.
   private(set) var cadenceHolds = 0
-  /// Which of the five output frames in the cycle comes next.
-  private var cadencePhase = 0
-  /// Output frames that take a fresh film frame. Phase 3 repeats, giving 4 pulls per 5 frames.
-  private static let cadencePulls = [true, true, true, false, true]
+  /// Fractional position between source frames, advanced one field slot at a time.
+  ///
+  /// Field slot i shows source frame floor(i * ratio). Keeping the fraction and watching it wrap is
+  /// the same thing without an unbounded counter, and it generalises: at 0.4 it reproduces exactly
+  /// the 2:3 table this replaced, at 0.834 the 5:6 that 50p into 59.94i needs, at 1.0 a new frame
+  /// every field, which is plain field-rate interlace.
+  private var cadenceAcc: Double = 0
 
-  /// Whether the cadence can actually run: asked for, weaving, and a source that really is 2/5 of
-  /// the field rate. 23.976 into 59.94 qualifies; 59.94p does not, and forcing it would throw away
-  /// half the motion. Caller holds `lock`.
+  /// Source frames per field slot, never above 1: a source cannot supply more distinct moments than
+  /// it has frames. Caller holds `lock`.
+  private var cadenceRatioLocked: Double {
+    guard fieldRate > 0 else { return 1 }
+    return min(1.0, sourceFrameRate / fieldRate)
+  }
+
+  /// Whether the cadence can run: asked for, weaving, and a source no faster than the field rate.
+  ///
+  /// This used to demand exactly 2/5, which is film and nothing else. Every rate below the field
+  /// rate has the same problem and the same answer, so the ratio is simply computed now. 50p into
+  /// 59.94i is the case that showed it up: it fell out of the film test, took the whole-frame
+  /// fallback, and published 50 frames a second at a card taking 29.97, so twenty of them a second
+  /// were silently never shown and which twenty was arbitrary.
   private var cadenceEngagedLocked: Bool {
     guard filmCadence, weaveFields, sourceFrameRate > 0, fieldRate > 0 else { return false }
-    return abs(sourceFrameRate - fieldRate * 0.4) < fieldRate * 0.01
+    return sourceFrameRate <= fieldRate * 1.01
+  }
+
+  /// Advance one field slot. True when the slot crosses into the next source frame.
+  private func stepCadenceSlot() -> Bool {
+    cadenceAcc += cadenceRatioLocked
+    guard cadenceAcc >= 1.0 else { return false }
+    cadenceAcc -= 1.0
+    return true
+  }
+
+  /// Move on to the next source frame, or record that there was not one to move to.
+  private func pullCadenceFrame() {
+    guard !filmReady.isEmpty else { cadenceHolds += 1; return }
+    filmSpare.append(previous)
+    previous = current
+    current = filmReady.removeFirst()
   }
 
   var cadenceEngaged: Bool {
@@ -134,6 +164,13 @@ final class DeckLinkVideoTap {
   private var weaveStarvedLocked: Bool {
     guard weaveFields, !cadenceEngagedLocked, sourceFrameRate > 0, fieldRate > 0 else { return false }
     return sourceFrameRate < fieldRate * 0.9
+  }
+
+  /// Source frame rate as last reported, for the panel to judge the capture rate against.
+  var sourceRate: Double {
+    lock.lock()
+    defer { lock.unlock() }
+    return sourceFrameRate
   }
 
   var weaveStarved: Bool {
@@ -310,7 +347,7 @@ final class DeckLinkVideoTap {
     self.sourceFrameRate = sourceFrameRate
     fieldRate = weaveFields ? fps * 2.0 : fps
     fieldParity = 0
-    cadencePhase = 0
+    cadenceAcc = 0
     // Keep the last picture across a re-arm when the raster has not changed. Re-allocating zeroed
     // buffers meant every settings change put black on the monitor until the next capture arrived,
     // and the feeder's own black fill covered the gap before that. The geometry check is what makes
@@ -812,39 +849,30 @@ final class DeckLinkVideoTap {
 
   // MARK: - consume (DeckLink thread)
 
-  /// Build one output frame of the 2:3 cycle straight into the feeder's buffer.
+  /// Build one output frame's two fields straight into the feeder's buffer.
   ///
   /// Called once per output frame, from the card's completion thread, which is why the cadence is
-  /// regular: the phase advances on the card's clock rather than on ours. Phases 1 and 2 take their
-  /// first field from the PREVIOUS film frame, which is what puts two film frames in one raster
-  /// exactly twice in five, as telecine does. Everything else shows one frame in both fields.
+  /// regular: the slot counter advances on the card's clock rather than on ours.
+  ///
+  /// Each field takes the source frame its slot lands on, and the slot counter is stepped twice per
+  /// output frame. Where two consecutive slots fall in different source frames the raster carries
+  /// two moments, which is what telecine sends and what a CRT scans. At 0.4 that is the 2:3 of
+  /// film; at 0.834 it is the 5:6 of 50p into a 59.94 field raster; at 1.0 every field is its own
+  /// frame. Nothing here is specific to any of them.
   ///
   /// No more row copies than a plain frame needs, so the cadence costs nothing here.
   /// Caller holds `lock`.
   private func composeCadenceFrame(into destination: UnsafeMutableRawPointer,
                                    width: Int, height: Int, stride: Int) {
-    let phase = cadencePhase
-    cadencePhase = (cadencePhase + 1) % Self.cadencePulls.count
-
-    // Promote a film frame, if the cycle wants one and capture has produced one. If it has not,
-    // hold the cycle where it is rather than advancing onto a frame that is not there: that shows
-    // as one film frame held a beat longer, which is what a projector would do, instead of a torn
-    // cadence. Buffers move by reference, so nothing here copies a frame.
-    if Self.cadencePulls[phase] {
-      if filmReady.isEmpty {
-        cadenceHolds += 1
-      } else {
-        filmSpare.append(previous)
-        previous = current
-        current = filmReady.removeFirst()
-      }
-    }
+    // The first field is whatever the current slot sits on. Held as a local because the step below
+    // may move `current` on, and this frame still needs the moment it had.
+    let firstSource = current
+    if stepCadenceSlot() { pullCadenceFrame() }
+    let secondSource = current
 
     let rowBytes = width * 4
     // The earlier moment has to land in the field the card transmits first.
     let firstStart = upperFieldFirst ? 0 : 1
-    let firstIsPrevious = (phase == 1 || phase == 2)
-    let firstSource = firstIsPrevious ? previous : current
 
     func blit(_ source: [UInt8], startingAt start: Int) {
       guard source.count == rowBytes * height else { return }
@@ -858,7 +886,10 @@ final class DeckLinkVideoTap {
       }
     }
     blit(firstSource, startingAt: firstStart)
-    blit(current, startingAt: 1 - firstStart)
+    blit(secondSource, startingAt: 1 - firstStart)
+
+    // Step on to the next output frame's first slot, so `current` is already right when it arrives.
+    if stepCadenceSlot() { pullCadenceFrame() }
   }
 
   /// Copy the most recent captured frame into the feeder's buffer.

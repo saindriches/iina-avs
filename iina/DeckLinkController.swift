@@ -136,6 +136,9 @@ class DeckLinkController {
   /// Times the cadence wanted a film frame and had none. Should stay at zero.
   var cadenceHolds: Int { tap.cadenceHolds }
 
+  /// Frame rate of the file being shown, as the tap last saw it.
+  var sourceFrameRate: Double { tap.sourceRate }
+
   /// Polls the routed player for its frame rate while output runs. On the main thread and once a
   /// second: mpv property reads must not happen on the GL thread, and the answer only changes when
   /// the file does.

@@ -342,13 +342,13 @@ extension MenuController {
                                           comment: "")
 
     let cadence = menu.addItem(withTitle: NSLocalizedString("menu.decklink_film_cadence",
-                                                            value: "Film Cadence (2:3 Pulldown)", comment: ""),
+                                                            value: "Pulldown Cadence", comment: ""),
                                action: #selector(menuDeckLinkToggleFilmCadence(_:)), keyEquivalent: "")
     cadence.target = self
     cadence.state = dl.filmCadence ? .on : .off
     cadence.isEnabled = dl.filmCadenceAvailable
     cadence.toolTip = NSLocalizedString("menu.decklink_film_cadence_tip",
-                                        value: "Lay 23.976 film onto the 59.94 field raster as broadcast does, three fields then two, generated on the card's clock rather than resampled from the window. Needs True Interlace, and the scheduled path rather than Low Latency, because the cadence has to be clocked by the card.",
+                                        value: "Spread a source slower than the field rate across the fields, generated on the card's clock rather than resampled from the window. 23.976 film into 59.94 fields gives the 2:3 of telecine, 50p gives 5:6, 30p a clean two fields each. Needs True Interlace, and the scheduled path rather than Low Latency, because the cadence has to be clocked by the card.",
                                         comment: "")
 
     let twitter = menu.addItem(withTitle: NSLocalizedString("menu.decklink_interline",
