@@ -195,6 +195,16 @@ class DeckLinkController {
   /// Drop what was read from the hardware, so the next read sees a device that has been plugged in
   /// or removed. Call from the event-rate paths (a panel or menu rebuild), never from a timer.
   func invalidateHardwareCaches() {
+    // Never re-read the hardware while an output session is open. The crash this guards against had
+    // a session live, packing frames on one thread, while the main thread built an iterator and
+    // called ConnectToDriverCore; a dispatch worker then died in _dispatch_bug_kevent_vanished,
+    // which is libdispatch aborting because a source's port was closed underneath it. Enumeration
+    // tears down and rebuilds exactly those ports inside DeckLinkAPI. Doing it less often made it
+    // rarer; not doing it during a session removes the window.
+    //
+    // The cost is that a card plugged in mid-session is not noticed until output stops, which is
+    // the right trade: the card in use cannot change anyway.
+    guard !output.isRunning else { return }
     deviceCache = nil
     driverAvailableCache = nil
     modeCache.removeAll()
