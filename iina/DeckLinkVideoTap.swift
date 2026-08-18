@@ -311,23 +311,32 @@ final class DeckLinkVideoTap {
     fieldRate = weaveFields ? fps * 2.0 : fps
     fieldParity = 0
     cadencePhase = 0
+    // Keep the last picture across a re-arm when the raster has not changed. Re-allocating zeroed
+    // buffers meant every settings change put black on the monitor until the next capture arrived,
+    // and the feeder's own black fill covered the gap before that. The geometry check is what makes
+    // it safe: a genuine mode change reallocates and starts from black, as it must.
+    let sameRaster = published.count == width * height * 4 && hasFrame
     working = [UInt8](repeating: 0, count: width * height * 4)
-    published = [UInt8](repeating: 0, count: width * height * 4)
+    if !sameRaster {
+      published = [UInt8](repeating: 0, count: width * height * 4)
+    }
     filmReady.removeAll()
     filmSpare.removeAll()
     cadenceHolds = 0
     if filmCadence {
       // The two a dirty output frame needs, plus enough spares that a burst never has to allocate
       // 8 MB on the GL thread mid-playback.
-      current = [UInt8](repeating: 0, count: width * height * 4)
-      previous = [UInt8](repeating: 0, count: width * height * 4)
+      // Seed the cadence from the last picture too, so re-arming it does not blank the monitor
+      // while the first film frames arrive.
+      current = sameRaster ? published : [UInt8](repeating: 0, count: width * height * 4)
+      previous = current
       for _ in 0...Self.filmQueueDepth {
         filmSpare.append([UInt8](repeating: 0, count: width * height * 4))
       }
     } else {
       current = []; previous = []
     }
-    hasFrame = false
+    hasFrame = sameRaster
     frameComplete = !weaveFields
     capturedFrames = 0
     publishedFrames = 0
@@ -513,7 +522,9 @@ final class DeckLinkVideoTap {
     lock.lock()
     targetWidth = 0
     targetHeight = 0
-    hasFrame = false
+    // `hasFrame` is deliberately left alone. copyLatest already refuses to hand anything out once
+    // the size guard fails, and keeping it lets a re-arm at the same raster carry the last picture
+    // over instead of flashing black.
     lock.unlock()
   }
 

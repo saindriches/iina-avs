@@ -391,14 +391,14 @@ class DeckLinkController {
     guard mode != fieldMode else { return }
     fieldMode = mode
     UserDefaults.standard.set(mode.rawValue, forKey: Keys.fieldMode)
-    restartIfNeeded()
+    reconfigureTapIfRunning()
   }
 
   func setFieldOrder(_ order: DeckLinkFieldOrder) {
     guard order != fieldOrder else { return }
     fieldOrder = order
     UserDefaults.standard.set(order.rawValue, forKey: Keys.fieldOrder)
-    restartIfNeeded()
+    reconfigureTapIfRunning()
   }
 
   /// Which field carries the earlier moment, after any override.
@@ -414,7 +414,7 @@ class DeckLinkController {
     guard on != interlineFilter else { return }
     interlineFilter = on
     UserDefaults.standard.set(on, forKey: Keys.interlineFilter)
-    restartIfNeeded()
+    reconfigureTapIfRunning()
   }
 
   /// Replace the picture with a bar that steps once per field, so field order can be read off the
@@ -437,7 +437,7 @@ class DeckLinkController {
     guard on != filmCadence else { return }
     filmCadence = on
     UserDefaults.standard.set(on, forKey: Keys.filmCadence)
-    restartIfNeeded()
+    reconfigureTapIfRunning()
   }
 
   /// Whether the cadence can be offered at all for the current setup.
@@ -517,26 +517,9 @@ class DeckLinkController {
     // The tap must be live before the device opens: preroll asks the provider for frames straight
     // away, and an inactive tap fails copyLatest's size guard. Preroll would then schedule nothing,
     // and a feeder driven by completion callbacks cannot start from an empty queue.
-    // Weave only when the raster is genuinely interlaced AND the user asked for it: PsF rasters are
-    // one instant by definition, and a progressive mode must not be touched.
-    let weave = mode.isInterlaced && fieldMode == .trueInterlace
-    // Immediate readback is synchronous, so it stalls the GL thread until the GPU is done. Weaving
-    // already needs twice as many readbacks, and at field rate that stall is what stops the pair
-    // completing in time, which the card then shows as a dropped field. Low Latency keeps its
-    // immediate DISPLAY either way; only the readback falls back to the pipelined path, at the cost
-    // of one field of delay that monitoring will never notice.
-    tap.immediateReadback = lowLatency && !weave   // sub-frame monitoring wants this frame, not the last one
-    // The filter is about an interlaced raster, PsF included, since a CRT scans alternate lines
-    // either way. A progressive mode has nothing to twitter, so it never gets it.
-    let filter = mode.isInterlacedOrPsF && interlineFilter
     // The cadence needs the card to clock the consumer, so it is only offered off the low-latency
     // path. Asking for it elsewhere leaves ordinary weaving rather than half-applying it.
-    tap.scaling = scaling
-    let cadence = weave && filmCadence && !lowLatency
-    tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
-                 weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),
-                 interlineFilter: filter,
-                 filmCadence: cadence, sourceFrameRate: routedSourceFrameRate())
+    armTap(for: mode)
 
     var ok = false
     do {
@@ -559,6 +542,40 @@ class DeckLinkController {
     }
     notifyChanged()
     return ok
+  }
+
+  /// Point the tap at a mode and the current processing settings.
+  ///
+  /// Weave only when the raster is genuinely interlaced AND it was asked for: PsF rasters are one
+  /// instant by definition, and a progressive mode must not be touched. The filter applies to any
+  /// interlaced raster, PsF included, since a CRT scans alternate lines either way. The cadence
+  /// additionally needs the card to clock the consumer, so it is off the low-latency path.
+  private func armTap(for mode: DeckLinkMode) {
+    let weave = mode.isInterlaced && fieldMode == .trueInterlace
+    // Immediate readback is synchronous, so it stalls the GL thread until the GPU is done. Weaving
+    // already needs twice as many readbacks, and at field rate that stall is what stops the pair
+    // completing in time, which the card then shows as a dropped field. Low Latency keeps its
+    // immediate DISPLAY either way; only the readback falls back to the pipelined path, at the cost
+    // of one field of delay that monitoring will never notice.
+    tap.immediateReadback = lowLatency && !weave
+    tap.scaling = scaling
+    tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
+                 weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),
+                 interlineFilter: mode.isInterlacedOrPsF && interlineFilter,
+                 filmCadence: weave && filmCadence && !lowLatency,
+                 sourceFrameRate: routedSourceFrameRate())
+  }
+
+  /// Re-arm the tap WITHOUT touching the device, for settings that only change how frames are built.
+  ///
+  /// Fields, field order, the filter and the cadence do not alter anything the card was opened with,
+  /// so closing and reopening it for them was needless: the monitor dropped signal and re-synced,
+  /// and the picture went black for as long as that took. The tap carries its last frame across a
+  /// re-arm at the same raster, so this is now invisible on the monitor.
+  private func reconfigureTapIfRunning() {
+    guard output.isRunning, let mode = selectedMode else { notifyChanged(); return }
+    armTap(for: mode)
+    notifyChanged()
   }
 
   /// User asked to stop. Clears the intent, so it stays off across launches.
