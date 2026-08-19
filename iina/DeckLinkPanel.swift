@@ -52,7 +52,8 @@ class DeckLinkPanelController: NSWindowController {
   private var scalingPopUp: NSPopUpButton!
   private var interlineBox: NSButton!
   private var filmCadenceBox: NSButton!
-  private var testPatternBox: NSButton!
+  private var testPatternPopUp: NSPopUpButton!
+  private var testOpacitySlider: NSSlider!
   private var use444Box: NSButton!
   private var levelABox: NSButton!
   private var nativeRenderBox: NSButton!
@@ -160,12 +161,21 @@ class DeckLinkPanelController: NSWindowController {
                                                        value: "Release Device When Inactive", comment: ""),
                           action: #selector(toggleRelease(_:)))
 
-    testPatternBox = addCheck(to: stack, NSLocalizedString("menu.decklink_test_pattern",
-                                                           value: "Field Order Test Pattern", comment: ""),
-                              action: #selector(toggleTestPattern(_:)))
-    testPatternBox.toolTip = NSLocalizedString("menu.decklink_test_pattern_tip",
-                                               value: "Replace the picture with a bar that advances one step every field. An even sweep means the fields are in the right order; a back-step every other field means they are swapped; a sweep that stalls and jumps means frames are being repeated, not misordered.",
-                                               comment: "")
+    testPatternPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_test_pattern",
+                                                          value: "Test Pattern", comment: ""),
+                             action: #selector(selectTestPattern(_:)))
+    testPatternPopUp.toolTip = NSLocalizedString("menu.decklink_test_pattern_tip",
+                                                 value: "Patterns that answer what the picture cannot. Field Order sweeps a bar one step per field: even is correct, a back-step every other field means swapped fields, a stall and jump means repetition. Geometry gives crosshatch, circle and safe-area boxes for setting a tube up. Twitter shows what the interline filter buys and costs. Greyscale sets black level, Bars check chroma and levels.",
+                                                 comment: "")
+    testOpacitySlider = NSSlider(value: 1.0, minValue: 0.05, maxValue: 1.0,
+                                 target: self, action: #selector(changeTestOpacity(_:)))
+    testOpacitySlider.isContinuous = true
+    testOpacitySlider.translatesAutoresizingMaskIntoConstraints = false
+    testOpacitySlider.widthAnchor.constraint(equalToConstant: 344).isActive = true
+    testOpacitySlider.toolTip = NSLocalizedString("menu.decklink_test_opacity_tip",
+                                                  value: "Mix the pattern over the picture instead of replacing it. A safe-area box is only useful against the shot it is meant to contain, and the overscan being measured is the overscan of real content.",
+                                                  comment: "")
+    stack.addArrangedSubview(testOpacitySlider)
 
     guard let content = window?.contentView else { return }
     content.addSubview(stack)
@@ -426,9 +436,27 @@ class DeckLinkPanelController: NSWindowController {
     nativeRenderBox.state = dl.renderAtOutputResolution ? .on : .off
     lowLatencyBox.state = dl.lowLatency ? .on : .off
     releaseBox.state = dl.releaseWhenInactive ? .on : .off
-    testPatternBox.state = dl.testPattern ? .on : .off
+    let patterns: [(DeckLinkTestPattern, String)] = [
+      (.off, NSLocalizedString("menu.decklink_pattern_off", value: "Off (video)", comment: "")),
+      (.fieldOrder, NSLocalizedString("menu.decklink_pattern_field", value: "Field Order Sweep", comment: "")),
+      (.geometry, NSLocalizedString("menu.decklink_pattern_geometry", value: "Geometry and Safe Area", comment: "")),
+      (.twitter, NSLocalizedString("menu.decklink_pattern_twitter", value: "Interline Twitter", comment: "")),
+      (.greyscale, NSLocalizedString("menu.decklink_pattern_grey", value: "Greyscale and Black Level", comment: "")),
+      (.colourBars, NSLocalizedString("menu.decklink_pattern_bars", value: "75% Colour Bars", comment: "")),
+    ]
+    testPatternPopUp.removeAllItems()
+    for (value, title) in patterns {
+      testPatternPopUp.addItem(withTitle: title)
+      testPatternPopUp.lastItem?.representedObject = value.rawValue
+    }
+    if let index = patterns.firstIndex(where: { $0.0 == dl.testPattern }) {
+      testPatternPopUp.selectItem(at: index)
+    }
+    testOpacitySlider.doubleValue = dl.testOpacity
+    testOpacitySlider.isEnabled = dl.testPattern != .off
+
     compensateAudioBox.state = dl.compensateAudio ? .on : .off
-    [nativeRenderBox, lowLatencyBox, releaseBox, testPatternBox,
+    [nativeRenderBox, lowLatencyBox, releaseBox, testPatternPopUp,
      compensateAudioBox].forEach { $0?.isEnabled = true }
 
     window?.setContentSize(NSSize(width: 380, height: fittingHeight()))
@@ -536,7 +564,7 @@ class DeckLinkPanelController: NSWindowController {
     // -- delay. Where the picture on the monitor sits relative to the window, and what the audio
     // is being shifted by to match it.
     var delay = String(format: "delay   %.0f ms, %ld in card",
-                       dl.estimatedLatency * 1000.0, dl.bufferedFrames)
+                       dl.smoothedLatency * 1000.0, dl.bufferedFrames)
     if dl.compensateAudio { delay += ", audio matched" }
     lines.append(delay)
 
@@ -651,9 +679,16 @@ class DeckLinkPanelController: NSWindowController {
     refresh()
   }
 
-  @objc private func toggleTestPattern(_ sender: NSButton) {
-    DeckLinkController.shared.testPattern = (sender.state == .on)
+  @objc private func selectTestPattern(_ sender: NSPopUpButton) {
+    guard let raw = sender.selectedItem?.representedObject as? Int,
+          let pattern = DeckLinkTestPattern(rawValue: raw) else { return }
+    DeckLinkController.shared.testPattern = pattern
     refresh()
+  }
+
+  @objc private func changeTestOpacity(_ sender: NSSlider) {
+    DeckLinkController.shared.testOpacity = sender.doubleValue
+    UserDefaults.standard.set(sender.doubleValue, forKey: "decklink.testOpacity")
   }
 
   @objc private func toggleRelease(_ sender: NSButton) {

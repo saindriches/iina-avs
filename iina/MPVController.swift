@@ -1371,7 +1371,11 @@ class MPVController: NSObject {
       }
       DispatchQueue.main.async { [self] in
         player.info.audioDelay = data
-        player.sendOSD(.audioDelay(data))
+        // DeckLink's audio compensation rewrites this whenever the measured video latency moves.
+        // An OSD for each of those flashes over the picture for a change the user did not make.
+        if DeckLinkController.shared.shouldShowAudioDelayOSD(data) {
+          player.sendOSD(.audioDelay(data))
+        }
         player.postNotification(.iinaAudioDelayChanged)
       }
 

@@ -31,6 +31,8 @@ private struct Keys {
   static let filmCadence = "decklink.filmCadence"
   static let scaling = "decklink.scaling"
   static let compensateAudio = "decklink.compensateAudio"
+  static let testPattern = "decklink.testPattern"
+  static let testOpacity = "decklink.testOpacity"
 }
 
 /// How the two fields of an interlaced frame are produced.
@@ -41,6 +43,25 @@ enum DeckLinkFieldMode: Int {
   /// Each field is its own moment, a field period apart, which is what a CRT's scan actually shows.
   /// Only buys anything when the source itself carries motion at the field rate.
   case trueInterlace = 1
+}
+
+/// Patterns that answer a question the picture cannot.
+enum DeckLinkTestPattern: Int {
+  case off = 0
+  /// A bar advancing one step per field: the only way to tell a wrong field order from a dropped
+  /// field, a repeated frame or a wandering cadence, which all just look like bad motion.
+  case fieldOrder = 1
+  /// Crosshatch, centre cross, circle and the two safe-area boxes. Geometry and linearity on a CRT
+  /// are adjustable and they drift; the circle shows whether the pixel aspect survived the chain,
+  /// and the boxes show how much the tube is really eating.
+  case geometry = 2
+  /// Single-line detail, which is what interline twitter destroys. Shows what the Interline Filter
+  /// buys and what it costs.
+  case twitter = 3
+  /// Staircase over a black-level strip, for setting brightness.
+  case greyscale = 4
+  /// 75% colour bars.
+  case colourBars = 5
 }
 
 /// What to do when the picture and the SDI raster are not the same shape.
@@ -156,6 +177,13 @@ class DeckLinkController {
     return tap.pipelineDelay + (Double(output.bufferedFrames) + 1.0) / mode.fps
   }
 
+  /// The same figure, smoothed.
+  ///
+  /// The raw number steps by a whole frame whenever the queue gains or loses one, which at 24 fps
+  /// is 42 ms: past the threshold below, so audio-delay would be rewritten every time the queue
+  /// breathed. Averaging leaves the audio alone unless the latency has genuinely moved.
+  private(set) var smoothedLatency: Double = 0
+
   /// Delay the audio to match, so lip sync holds on the reference monitor rather than on the Mac.
   ///
   /// The picture reaches the SDI monitor later than it reaches the window, but the audio does not,
@@ -164,6 +192,25 @@ class DeckLinkController {
   private(set) var compensateAudio: Bool
   /// What audio-delay was before we touched it, so it can be handed back untouched.
   private var savedAudioDelay: Double?
+  /// The value we last wrote, so the property observer can tell our write from the user's.
+  private var audioDelayWeWrote: Double?
+
+  /// Whether a change to audio-delay deserves an OSD. Ours do not: the compensation rewrites the
+  /// value whenever the measured latency moves, and flashing "Audio Delay" over the video for a
+  /// change the user did not make is just noise. Matching on the value rather than holding a flag
+  /// keeps it self-limiting, since the observer arrives asynchronously and might not arrive at all.
+  func shouldShowAudioDelayOSD(_ value: Double) -> Bool {
+    if let ours = audioDelayWeWrote, abs(ours - value) < 0.0005 {
+      audioDelayWeWrote = nil
+      return false
+    }
+    return true
+  }
+
+  private func writeAudioDelay(_ value: Double, to mpv: MPVController) {
+    audioDelayWeWrote = value
+    mpv.setDouble(MPVOption.Audio.audioDelay, value)
+  }
 
   /// Polls the routed player for its frame rate while output runs. On the main thread and once a
   /// second: mpv property reads must not happen on the GL thread, and the answer only changes when
@@ -332,6 +379,9 @@ class DeckLinkController {
     filmCadence = d.object(forKey: Keys.filmCadence) as? Bool ?? true
     scaling = DeckLinkScaling(rawValue: d.object(forKey: Keys.scaling) as? Int ?? 0) ?? .fit
     compensateAudio = d.bool(forKey: Keys.compensateAudio)
+    // Pattern is deliberately not persisted; coming back to a test card instead of a picture would
+    // be its own bug report. The opacity is, since it is a preference rather than a state.
+    tap.testOpacity = d.object(forKey: Keys.testOpacity) as? Double ?? 1.0
     updateActivityObservers()
     observeActivationForRestore()
     observeSleepWake()
@@ -463,9 +513,17 @@ class DeckLinkController {
   /// Replace the picture with a bar that steps once per field, so field order can be read off the
   /// monitor instead of inferred from how motion feels. Not persisted: it is a diagnostic, and
   /// coming back to a bar instead of a picture would be its own bug report.
-  var testPattern: Bool {
+  var testPattern: DeckLinkTestPattern {
     get { tap.testPattern }
     set { tap.testPattern = newValue; notifyChanged() }
+  }
+
+  /// How strongly the pattern is mixed over the picture. Below 1 the two are blended, which is what
+  /// makes the geometry pattern useful: a safe-area box means something against the shot it is
+  /// meant to contain.
+  var testOpacity: Double {
+    get { tap.testOpacity }
+    set { tap.testOpacity = max(0.05, min(1.0, newValue)); notifyChanged() }
   }
 
   func setScaling(_ mode: DeckLinkScaling) {
@@ -494,15 +552,15 @@ class DeckLinkController {
     guard let player = routedPlayer, player.info.state.loaded, let mpv = player.mpv else { return }
     guard compensateAudio, output.isRunning else {
       if let saved = savedAudioDelay {
-        mpv.setDouble(MPVOption.Audio.audioDelay, saved)
+        writeAudioDelay(saved, to: mpv)
         savedAudioDelay = nil
       }
       return
     }
     if savedAudioDelay == nil { savedAudioDelay = mpv.getDouble(MPVOption.Audio.audioDelay) }
-    let target = estimatedLatency
+    let target = smoothedLatency
     if abs(mpv.getDouble(MPVOption.Audio.audioDelay) - target) > 0.005 {
-      mpv.setDouble(MPVOption.Audio.audioDelay, target)
+      writeAudioDelay(target, to: mpv)
     }
   }
 
@@ -535,6 +593,8 @@ class DeckLinkController {
     let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
       guard let self = self else { return }
       self.tap.updateSourceFrameRate(self.routedSourceFrameRate())
+      let now = self.estimatedLatency
+      self.smoothedLatency = self.smoothedLatency > 0 ? self.smoothedLatency * 0.7 + now * 0.3 : now
       self.updateAudioCompensation()
     }
     RunLoop.main.add(timer, forMode: .common)

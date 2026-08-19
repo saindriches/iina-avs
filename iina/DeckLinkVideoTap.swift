@@ -208,44 +208,167 @@ final class DeckLinkVideoTap {
     lock.unlock()
   }
 
-  // MARK: - field order test pattern
+  // MARK: - test patterns
 
-  /// Replace the picture with something whose temporal order can be READ off the monitor.
+  /// Which pattern to draw, and how strongly.
   ///
-  /// Field order cannot be judged from ordinary footage: a wrong order looks like bad motion, which
-  /// is also what a dropped field, a repeated frame and a wandering cadence look like. So put out a
-  /// bar that advances a fixed step every field and nothing else. Then the monitor answers directly:
-  ///
-  /// - smooth sweep, even steps      -> fields are in the right order
-  /// - sweep with a back-step every other field -> the two fields of a frame are swapped
-  /// - sweep that stalls and jumps   -> frames are being repeated or dropped, not misordered
-  ///
-  /// The bar is generated where the real picture would have been stored, so it goes through the same
-  /// weaving, cadence, packing and scheduling as video does. It tests the path, not just the maths.
-  var testPattern = false
-  /// Advances once per field written (or per film frame, with the cadence running).
+  /// Drawn OVER the captured picture rather than instead of it, so `testOpacity` can dissolve
+  /// between the two. That matters most for the geometry pattern: a safe-area box is only useful
+  /// against the shot it is meant to contain, and on a CRT the overscan you are measuring is the
+  /// overscan of real content. At full opacity it replaces, which is what the level and colour
+  /// patterns want.
+  var testPattern: DeckLinkTestPattern = .off
+  var testOpacity: Double = 1.0
+  /// Advances once per field written, or per source frame with the cadence running.
   private var testStep = 0
 
-  /// Paint the bar for step `step` into `dst`, on `rows` only, leaving other rows untouched.
-  private func drawTestBar(_ dst: UnsafeMutableRawPointer, width w: Int, height h: Int,
-                           step: Int, startRow: Int, everyOtherRow: Bool) {
-    // 10-bit 2:10:10:10, matching the capture format. Full-range white and a dim grey ground, so a
-    // field that never gets written reads as black rather than as part of the pattern.
-    let white: UInt32 = 0xFFFF_FFFF
-    let ground: UInt32 = (1 << 30) | (64 << 20) | (64 << 10) | 64
-    let barWidth = max(8, w / 60)
-    let travel = max(1, w / 48)                 // one step per field, wrapping across the raster
-    let x0 = (step * travel) % max(1, w - barWidth)
+  /// 10-bit components into the packed 2:10:10:10 word the capture format uses. Alpha is set but
+  /// nothing downstream reads it.
+  private func rgb(_ r: Int, _ g: Int, _ b: Int) -> UInt32 {
+    let clamp = { (v: Int) -> UInt32 in UInt32(max(0, min(1023, v))) }
+    return (3 << 30) | (clamp(r) << 20) | (clamp(g) << 10) | clamp(b)
+  }
 
-    var y = startRow
-    while y < h {
-      let row = dst.advanced(by: y * w * 4).assumingMemoryBound(to: UInt32.self)
-      for x in 0..<w { row[x] = (x >= x0 && x < x0 + barWidth) ? white : ground }
-      y += everyOtherRow ? 2 : 1
+  /// Write one pixel, mixing with what the capture put there.
+  ///
+  /// The lerp is done per 10-bit field with an integer weight, so the whole thing stays a handful
+  /// of shifts and multiplies. Opaque short-circuits to a plain store, which is the common case.
+  private func plot(_ dst: UnsafeMutablePointer<UInt32>, _ index: Int, _ colour: UInt32, _ weight: Int) {
+    if weight >= 256 { dst[index] = colour; return }
+    let under = dst[index]
+    let inv = 256 - weight
+    var out: UInt32 = 3 << 30
+    for shift in [20, 10, 0] {
+      let a = Int((under >> UInt32(shift)) & 0x3FF)
+      let b = Int((colour >> UInt32(shift)) & 0x3FF)
+      out |= UInt32((a * inv + b * weight) >> 8) << UInt32(shift)
+    }
+    dst[index] = out
+  }
+
+  /// Draw the selected pattern over rows of the buffer that this sample owns.
+  ///
+  /// `startRow`/`everyOtherRow` are the field being written, so a pattern lands only on the lines
+  /// this sample is responsible for and weaving still works underneath it.
+  private func drawTestPattern(_ base: UnsafeMutableRawPointer, width w: Int, height h: Int,
+                               startRow: Int, everyOtherRow: Bool) {
+    guard testPattern != .off, w > 0, h > 0 else { return }
+    let dst = base.assumingMemoryBound(to: UInt32.self)
+    let weight = max(0, min(256, Int(testOpacity * 256.0)))
+    let stride = everyOtherRow ? 2 : 1
+
+    // Row range this sample owns, as a helper so each pattern can stay a few lines.
+    func forEachRow(_ body: (Int, UnsafeMutablePointer<UInt32>) -> Void) {
+      var y = startRow
+      while y < h { body(y, dst.advanced(by: y * w)); y += stride }
+    }
+
+    switch testPattern {
+    case .off:
+      return
+
+    case .fieldOrder:
+      // A bar advancing a fixed step every field. Nothing else separates a wrong field order from a
+      // dropped field, a repeated frame or a wandering cadence: they all just look like bad motion.
+      // Even sweep is correct, a back-step every other field is swapped fields, a stall and jump is
+      // repetition. See the release notes for build 20.
+      let barWidth = max(8, w / 60)
+      let travel = max(1, w / 48)
+      let x0 = (testStep * travel) % max(1, w - barWidth)
+      let ground = rgb(64, 64, 64)
+      let mark = rgb(1023, 1023, 1023)
+      forEachRow { _, row in
+        for x in 0..<w { plot(row, x, (x >= x0 && x < x0 + barWidth) ? mark : ground, weight) }
+      }
+
+    case .geometry:
+      // Crosshatch, centre cross, a circle and the two safe-area boxes. On a CRT this is the one
+      // that earns its keep: geometry and linearity are adjustable and drift, the circle shows
+      // whether the pixel aspect survived the chain, and the boxes show how much the tube is
+      // actually eating. Overlaid at partial opacity it can be judged against real content.
+      let line = rgb(1023, 1023, 1023)
+      let boxAction = rgb(1023, 900, 0)
+      let boxTitle = rgb(1023, 300, 300)
+      let stepX = max(16, w / 16), stepY = max(16, h / 12)
+      let cx = w / 2, cy = h / 2
+      let radius = min(w, h) / 2 - 2
+      // 90% action safe, 80% title safe, the usual broadcast pair.
+      let a0x = w / 20, a1x = w - w / 20, a0y = h / 20, a1y = h - h / 20
+      let t0x = w / 10, t1x = w - w / 10, t0y = h / 10, t1y = h - h / 10
+      forEachRow { y, row in
+        let onActionEdge = (y == a0y || y == a1y - 1)
+        let onTitleEdge = (y == t0y || y == t1y - 1)
+        // Circle: solve for x at this row, and mark both sides.
+        let dy = y - cy
+        let inCircle = abs(dy) <= radius
+        let halfChord = inCircle ? Int((Double(radius * radius - dy * dy)).squareRoot()) : 0
+        for x in 0..<w {
+          if x % stepX == 0 || y % stepY == 0 || x == cx || y == cy {
+            plot(row, x, line, weight)
+          }
+          if inCircle, abs(abs(x - cx) - halfChord) < 1 { plot(row, x, line, weight) }
+          if (onActionEdge && x >= a0x && x < a1x) || (x == a0x || x == a1x - 1) && y >= a0y && y < a1y {
+            plot(row, x, boxAction, weight)
+          }
+          if (onTitleEdge && x >= t0x && x < t1x) || (x == t0x || x == t1x - 1) && y >= t0y && y < t1y {
+            plot(row, x, boxTitle, weight)
+          }
+        }
+      }
+
+    case .twitter:
+      // Single-line detail, which is exactly what interline twitter destroys: on an interlaced CRT
+      // each of these lines is drawn by only one field, so it flickers at half the field rate.
+      // Turning the Interline Filter on should visibly calm it, and this is the honest way to see
+      // what that filter costs in vertical resolution.
+      let bright = rgb(1023, 1023, 1023)
+      let dark = rgb(0, 0, 0)
+      forEachRow { y, row in
+        let colour = (y % 2 == 0) ? bright : dark
+        // Left half single-line, right half two-line pairs, so the difference is visible together.
+        let paired = ((y / 2) % 2 == 0) ? bright : dark
+        for x in 0..<w { plot(row, x, x < w / 2 ? colour : paired, weight) }
+      }
+
+    case .greyscale:
+      // An eleven step staircase over a black-level strip. The strip is what sets brightness on a
+      // CRT: raise it until the lightest of the three patches is just visible and the darkest is
+      // not. There is no sub-black patch, deliberately, because SMPTE mapping happens in the packer
+      // and nothing generated here can land below the black point to begin with.
+      let steps = 11
+      let bandTop = h * 2 / 3
+      forEachRow { y, row in
+        if y < bandTop {
+          let level = (y * 0) + 0   // staircase varies with x only
+          _ = level
+          for x in 0..<w {
+            let stepIndex = min(steps - 1, x * steps / w)
+            let v = stepIndex * 1023 / (steps - 1)
+            plot(row, x, rgb(v, v, v), weight)
+          }
+        } else {
+          for x in 0..<w {
+            // black, +2%, +4%, repeating across the width
+            let patch = (x * 6) / w
+            let v = [0, 20, 41, 0, 20, 41][min(5, patch)]
+            plot(row, x, rgb(v, v, v), weight)
+          }
+        }
+      }
+
+    case .colourBars:
+      // 75% bars, the standard reference for chroma and for checking that 4:4:4 and the levels
+      // setting are doing what they claim.
+      let c = 767
+      let bars = [rgb(c, c, c), rgb(c, c, 0), rgb(0, c, c), rgb(0, c, 0),
+                  rgb(c, 0, c), rgb(c, 0, 0), rgb(0, 0, c), rgb(0, 0, 0)]
+      forEachRow { _, row in
+        for x in 0..<w { plot(row, x, bars[min(bars.count - 1, x * bars.count / w)], weight) }
+      }
     }
   }
 
-  /// Vertical low-pass before the lines are split into fields.
+  /// Vertical low-pass before the lines are split into fields.  /// Vertical low-pass before the lines are split into fields.
   ///
   /// A CRT draws alternate lines in alternate fields, so any detail that lives on a single line
   /// appears at the field rate rather than the frame rate and shimmers: interline twitter, worst on
@@ -505,19 +628,17 @@ final class DeckLinkVideoTap {
       if buffer.count != rowBytes * h { buffer = [UInt8](repeating: 0, count: rowBytes * h) }
       buffer.withUnsafeMutableBytes { raw in
         guard let dstBase = raw.baseAddress else { return }
-        if testPattern {
-          // One step per FILM frame, so the cadence's own 3:2 shows as the uneven-but-regular
-          // telecine beat rather than as a smooth sweep.
-          drawTestBar(dstBase, width: w, height: h, step: testStep, startRow: 0, everyOtherRow: false)
-          testStep += 1
-        } else if interlineFilter {
+        if interlineFilter {
           let srcWords = src.assumingMemoryBound(to: UInt32.self)
           let dstWords = dstBase.assumingMemoryBound(to: UInt32.self)
           for y in 0..<h { filteredRow(srcWords, dstWords.advanced(by: y * w), width: w, y: y, height: h) }
         } else {
           memcpy(dstBase, src, rowBytes * h)
         }
+        // One step per FILM frame, so the cadence's own beat shows rather than a smooth sweep.
+        drawTestPattern(dstBase, width: w, height: h, startRow: 0, everyOtherRow: false)
       }
+      if testPattern != .off { testStep += 1 }
       filmReady.append(buffer)
       // Bound the queue. Dropping the OLDEST keeps latency fixed and loses the frame furthest from
       // what should be on screen, which only happens if the card has stopped consuming.
@@ -548,30 +669,24 @@ final class DeckLinkVideoTap {
       }
 
       guard weaving else {
-        if testPattern {
-          drawTestBar(dstBase, width: w, height: h, step: testStep, startRow: 0, everyOtherRow: false)
-          testStep += 1
-        } else if interlineFilter {
+        if interlineFilter {
           for y in 0..<h { copyRow(y) }
         } else {
           memcpy(dstBase, src, rowBytes * h)   // untouched fast path
         }
+        drawTestPattern(dstBase, width: w, height: h, startRow: 0, everyOtherRow: false)
         return
       }
 
       // Only this field's rows. The other half of `working` still holds the frame published two
       // pairs ago and is overwritten by this pair's second sample before anything sees it.
       let first = fieldStartRow()
-      if testPattern {
-        // One step per FIELD. A correct order sweeps evenly; swapped fields step back every other
-        // one; a starved or repeated frame makes the sweep stall and jump.
-        drawTestBar(dstBase, width: w, height: h, step: testStep, startRow: first, everyOtherRow: true)
-        testStep += 1
-        return
-      }
       var y = first
       while y < h { copyRow(y); y += 2 }
+      // One step per FIELD, so a swapped order shows as a back-step every other one.
+      drawTestPattern(dstBase, width: w, height: h, startRow: first, everyOtherRow: true)
     }
+    if testPattern != .off { testStep += 1 }
     if weaving { fieldParity ^= 1 }
     // Parity back at 0 means the second field of the pair has just landed.
     frameComplete = !weaving || fieldParity == 0
