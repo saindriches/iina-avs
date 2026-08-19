@@ -259,9 +259,36 @@ final class DeckLinkVideoTap {
 
   /// Source frames per field slot, never above 1: a source cannot supply more distinct moments than
   /// it has frames. Caller holds `lock`.
-  private var cadenceRatioLocked: Double {
-    guard fieldRate > 0 else { return 1 }
-    return min(1.0, effectiveSourceRateLocked / fieldRate)
+  private var cadenceRatioLocked: Double { cadenceRatioCache }
+
+  /// Latched, and snapped to the simple fraction it is obviously trying to be.
+  ///
+  /// Two faults, both visible in a trace. It was recomputed from a LIVE measurement on every step,
+  /// so the ratio jittered and the accumulator wandered into arbitrary phases: 0.3066 and 0.4223
+  /// were recorded, nowhere near the half this content means. And the raw quotient is never exact,
+  /// because mpv reports 29.970029830932617 for a 30000/1001 file while the card's field rate is
+  /// the exact double, giving 0.4999999976 instead of a half.
+  ///
+  /// Every cadence worth having is a simple fraction: a half, two fifths for film, five twelfths
+  /// for 25p, one for a matched source. So find the small fraction the measurement is within a
+  /// thousandth of and use that instead. The accumulator then lands exactly where the arithmetic
+  /// says, which is what stops the wrap sliding onto the wrong step.
+  private var cadenceRatioCache: Double = 1
+  private func refreshCadenceRatioLocked() {
+    guard fieldRate > 0 else { cadenceRatioCache = 1; return }
+    let raw = min(1.0, effectiveSourceRateLocked / fieldRate)
+    for denominator in 1...12 {
+      let numerator = (raw * Double(denominator)).rounded()
+      guard numerator >= 1 else { continue }
+      let candidate = numerator / Double(denominator)
+      // Tight on purpose. This exists to remove float slop, not to round a rate to a neater one:
+      // at a thousandth it would pull 25p onto five twelfths and 50p onto five sixths, which are
+      // the 60 Hz fractions, and against a 59.94 field rate that is a real error of a part in a
+      // thousand rather than a tidying up. A hundred-thousandth catches the quotient noise and
+      // nothing else.
+      if abs(raw - candidate) < 1e-5 { cadenceRatioCache = min(1.0, candidate); return }
+    }
+    cadenceRatioCache = raw
   }
 
   /// Whether the cadence can run: asked for, weaving, and a source no faster than the field rate.
@@ -279,7 +306,16 @@ final class DeckLinkVideoTap {
   /// Advance one field slot. True when the slot crosses into the next source frame.
   private func stepCadenceSlot() -> Bool {
     cadenceAcc += cadenceRatioLocked
-    guard cadenceAcc >= 1.0 else { return false }
+    // Tolerance, because the ratio is a quotient of two measured rates and lands a hair under the
+    // exact fraction it means. mpv reports 29.970029830932617 for a 30000/1001 file, rounded
+    // through a float somewhere, and the card's field rate is the exact double: the ratio is then
+    // 0.4999999976 rather than a half, two steps sum to 0.9999999953, and the trailing step MISSES
+    // its wrap. The wrap slides onto the next frame's leading step and stays there, so every frame
+    // afterwards pairs two different moments. Measured in a trace: 1162 mixed frames in one run,
+    // ending only when a hold happened to reset the phase.
+    //
+    // A part in a million is far below any real cadence difference and far above the slop.
+    guard cadenceAcc >= 1.0 - 1e-6 else { return false }
     cadenceAcc -= 1.0
     return true
   }
@@ -486,6 +522,7 @@ final class DeckLinkVideoTap {
       // This is what decides whether weaving runs at all, so a change to it can switch the mode
       // mid-pair. Start the next pair cleanly rather than half way through the previous one.
       fieldParity = 0
+      refreshCadenceRatioLocked()
       updateSampleIntervalLocked()
       nextSampleAt = 0        // the sample rate changed with it, so restart the phase
     }
@@ -779,6 +816,7 @@ final class DeckLinkVideoTap {
     frameRate = fps
     fieldParity = 0
     cadenceAcc = 0
+    traceHead = 0        // a re-arm starts a new session; old records would read as this one's
     sourceConsumed = 0
     pairingNeedsCatchUp = false
     // Keep the last picture across a re-arm when the raster has not changed. Re-allocating zeroed
@@ -818,6 +856,7 @@ final class DeckLinkVideoTap {
     nextSampleAt = 0
     hookIntervalEMA = 0
     lastHookAt = 0
+    refreshCadenceRatioLocked()
     updateSampleIntervalLocked()
     lock.unlock()
   }
