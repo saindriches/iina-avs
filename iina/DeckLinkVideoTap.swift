@@ -153,7 +153,13 @@ final class DeckLinkVideoTap {
   /// frames and the pattern survive.
   private var filmReady = [[UInt8]]()
   private var filmSpare = [[UInt8]]()
-  private static let filmQueueDepth = 4
+  /// How deep the queue is allowed to get, which is bought entirely in latency.
+  ///
+  /// Four is what the SCHEDULED worker needs, because it fills every free buffer back to back and
+  /// its bursts reach that. The card-paced path has no bursts at all, one provider call per output
+  /// frame, so four there is three frames of delay for nothing: measured at 164 ms against 33 ms for
+  /// the modes that do not queue. Sized to the consumer instead of to the worst consumer.
+  private var filmQueueDepth = 4
   private var current = [UInt8]()
   private var previous = [UInt8]()
   /// Whether the one line shift is actually being applied, as opposed to merely asked for. The two
@@ -588,7 +594,8 @@ final class DeckLinkVideoTap {
   func activate(width: Int, height: Int, fps: Double,
                 weaveFields: Bool = false, upperFieldFirst: Bool = true,
                 interlineFilter: Bool = false,
-                filmCadence: Bool = false, sourceFrameRate: Double = 0) {
+                filmCadence: Bool = false, sourceFrameRate: Double = 0,
+                queueDepth: Int = 4) {
     lock.lock()
     targetWidth = width
     targetHeight = height
@@ -596,6 +603,7 @@ final class DeckLinkVideoTap {
     self.upperFieldFirst = upperFieldFirst
     self.interlineFilter = interlineFilter
     self.filmCadence = filmCadence
+    filmQueueDepth = max(1, queueDepth)
     self.sourceFrameRate = sourceFrameRate
     fieldRate = weaveFields ? fps * 2.0 : fps
     frameRate = fps
@@ -620,7 +628,7 @@ final class DeckLinkVideoTap {
       // while the first film frames arrive.
       current = sameRaster ? published : [UInt8](repeating: 0, count: width * height * 4)
       previous = current
-      for _ in 0...Self.filmQueueDepth {
+      for _ in 0...filmQueueDepth {
         filmSpare.append([UInt8](repeating: 0, count: width * height * 4))
       }
     } else {
@@ -778,7 +786,7 @@ final class DeckLinkVideoTap {
       filmReady.append(buffer)
       // Bound the queue. Dropping the OLDEST keeps latency fixed and loses the frame furthest from
       // what should be on screen, which only happens if the card has stopped consuming.
-      while filmReady.count > Self.filmQueueDepth { filmSpare.append(filmReady.removeFirst()) }
+      while filmReady.count > filmQueueDepth { filmSpare.append(filmReady.removeFirst()) }
       hasFrame = true
       frameComplete = true
       capturedFrames += 1

@@ -799,14 +799,22 @@ class DeckLinkController {
     // completing in time, which the card then shows as a dropped field. Low Latency keeps its
     // immediate DISPLAY either way; only the readback falls back to the pipelined path, at the cost
     // of one field of delay that monitoring will never notice.
-    tap.immediateReadback = lowLatency && !weave
+    // Immediate readback stalls the GL thread until the GPU is done, which is why weaving avoided
+    // it: at the FIELD rate that stall is what stopped a pair completing in time. The cadence
+    // samples at the SOURCE rate instead, half as often here, so the stall is affordable again and
+    // skipping the ping-pong saves a whole capture interval of delay.
+    let cadenceWanted = weave && filmCadence
+    tap.immediateReadback = lowLatency && (!weave || cadenceWanted)
     tap.scaling = scaling
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
                  weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),
                  interlineFilter: mode.isInterlacedOrPsF && interlineFilter
                                   && fieldMode != .sourceInterlaced,
-                 filmCadence: weave && filmCadence,
-                 sourceFrameRate: routedSourceFrameRate())
+                 filmCadence: cadenceWanted,
+                 sourceFrameRate: routedSourceFrameRate(),
+                 // The card-paced path calls the provider once per output frame and never bursts,
+                 // so it needs no cushion beyond the one frame being assembled.
+                 queueDepth: lowLatency ? 2 : 4)
   }
 
   /// Re-arm the tap WITHOUT touching the device, for settings that only change how frames are built.
