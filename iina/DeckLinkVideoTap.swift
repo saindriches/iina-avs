@@ -284,6 +284,58 @@ final class DeckLinkVideoTap {
     return true
   }
 
+  // MARK: - trace ring
+
+  /// One record per interesting moment, kept in a fixed ring so the minutes BEFORE an event survive.
+  ///
+  /// Cumulative counters say a thing happened; they cannot say what the state was when it did. The
+  /// faults left here are transitions, so what is needed is the sequence around one, and the only
+  /// person who can see the event is looking at a CRT with a second or two of reaction time. Hence
+  /// a ring plus a button: press after it happens and the window leading up to it is already
+  /// captured.
+  ///
+  /// Always on. One array store per frame, no allocation, nothing to enable and forget.
+  struct TraceRecord {
+    var time: Double = 0
+    var kind: UInt8 = 0        // 1 compose, 2 capture, 3 handout
+    var flags: UInt8 = 0       // 1 hold, 2 mixed, 4 dup, 8 catch-up, 16 pulled on leading step
+    var queue: UInt16 = 0
+    var phase: Float = 0
+    var consumed: Int32 = 0
+    var fieldA: Int32 = 0      // source index into the field sent FIRST
+    var fieldB: Int32 = 0
+  }
+  private var trace = [TraceRecord](repeating: TraceRecord(), count: 8192)
+  private var traceHead = 0
+
+  private func record(kind: UInt8, flags: UInt8, fieldA: Int32 = -1, fieldB: Int32 = -1) {
+    trace[traceHead % trace.count] = TraceRecord(
+      time: CACurrentMediaTime(), kind: kind, flags: flags,
+      queue: UInt16(min(filmReady.count, Int(UInt16.max))), phase: Float(cadenceAcc),
+      consumed: Int32(truncatingIfNeeded: sourceConsumed), fieldA: fieldA, fieldB: fieldB)
+    traceHead &+= 1
+  }
+
+  /// Oldest first, as CSV. Taken under the lock so it cannot tear against the GL or feeder threads.
+  func traceCSV() -> String {
+    lock.lock()
+    defer { lock.unlock() }
+    var out = "t,kind,hold,mixed,dup,catchup,leadstep,queue,phase,consumed,fieldA,fieldB\n"
+    let total = min(traceHead, trace.count)
+    let start = traceHead >= trace.count ? traceHead % trace.count : 0
+    let base = total > 0 ? trace[start].time : 0
+    for i in 0..<total {
+      let r = trace[(start + i) % trace.count]
+      let kind = ["", "compose", "capture", "handout"][Int(min(r.kind, 3))]
+      out += String(format: "%.6f,%@,%d,%d,%d,%d,%d,%d,%.4f,%d,%d,%d\n",
+                    r.time - base, kind,
+                    r.flags & 1, (r.flags >> 1) & 1, (r.flags >> 2) & 1,
+                    (r.flags >> 3) & 1, (r.flags >> 4) & 1,
+                    Int(r.queue), r.phase, Int(r.consumed), Int(r.fieldA), Int(r.fieldB))
+    }
+    return out
+  }
+
   /// Frames whose two fields came from DIFFERENT source frames.
   ///
   /// At or below half the field rate this must be zero: one source frame per output frame means
@@ -296,6 +348,7 @@ final class DeckLinkVideoTap {
   private func pullCadenceFrame() {
     guard !filmReady.isEmpty else {
       cadenceHolds += 1
+      record(kind: 1, flags: 1)
       // Do NOT refund the phase here. Adding a whole frame of it makes the very next slot re-wrap,
       // which moves the pull from the trailing step to the leading one: the frame then pairs two
       // different source moments, consumes two frames instead of one, drains the queue and causes
@@ -904,6 +957,7 @@ final class DeckLinkVideoTap {
       }
       if testPattern != .off { testStep += 1 }
       filmReady.append(buffer)
+      record(kind: 2, flags: 0)
       // Bound the queue. Dropping the OLDEST keeps latency fixed and loses the frame furthest from
       // what should be on screen, which only happens if the card has stopped consuming.
       while filmReady.count > filmQueueDepth { filmSpare.append(filmReady.removeFirst()) }
@@ -1347,7 +1401,13 @@ final class DeckLinkVideoTap {
     let consumedBefore = sourceConsumed
     if stepCadenceSlot() { pullCadenceFrame() }
     let secondSource = current
-    if sourceConsumed != consumedBefore { mixedFrames += 1 }
+    let mixed = sourceConsumed != consumedBefore
+    if mixed { mixedFrames += 1 }
+    // The leading-step pull is the tell for a slipped phase: at or below half the field rate it
+    // should never happen, because the wrap belongs on the trailing step.
+    record(kind: 1, flags: mixed ? 0b10010 : 0,
+           fieldA: Int32(truncatingIfNeeded: consumedBefore),
+           fieldB: Int32(truncatingIfNeeded: sourceConsumed))
 
     let rowBytes = width * 4
     // The earlier moment has to land in the field the card transmits first.
@@ -1385,7 +1445,13 @@ final class DeckLinkVideoTap {
       return true   // the cadence builds a new frame every time, so it can never be a duplicate
     }
 
-    if publishSerial == lastHandedSerial { duplicatesOut += 1 } else { lastHandedSerial = publishSerial }
+    if publishSerial == lastHandedSerial {
+      duplicatesOut += 1
+      record(kind: 3, flags: 0b100)
+    } else {
+      lastHandedSerial = publishSerial
+      record(kind: 3, flags: 0)
+    }
 
     guard published.count == width * height * 4 else { return false }
     let rowBytes = width * 4

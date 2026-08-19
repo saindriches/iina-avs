@@ -51,6 +51,7 @@ class DeckLinkPanelController: NSWindowController {
   private var fieldOrderPopUp: NSPopUpButton!
   private var scalingPopUp: NSPopUpButton!
   private var flipFieldsButton: NSButton!
+  private var saveTraceButton: NSButton!
   private var interlineBox: NSButton!
   private var filmCadenceBox: NSButton!
   private var testPatternPopUp: NSPopUpButton!
@@ -170,6 +171,15 @@ class DeckLinkPanelController: NSWindowController {
     releaseBox = addCheck(to: stack, NSLocalizedString("menu.decklink_release",
                                                        value: "Release Device When Inactive", comment: ""),
                           action: #selector(toggleRelease(_:)))
+
+    saveTraceButton = NSButton(title: NSLocalizedString("menu.decklink_save_trace",
+                                                       value: "Save Trace", comment: ""),
+                               target: self, action: #selector(saveTrace(_:)))
+    saveTraceButton.bezelStyle = .rounded
+    saveTraceButton.toolTip = NSLocalizedString("menu.decklink_save_trace_tip",
+                                                value: "Write the last few minutes of per-frame history to a CSV in Library/Logs/IINA and reveal it. Press it AFTER seeing something wrong: the history is already recorded, so reaction time does not matter.",
+                                                comment: "")
+    stack.addArrangedSubview(saveTraceButton)
 
     testPatternPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_test_pattern",
                                                           value: "Test Pattern", comment: ""),
@@ -698,6 +708,14 @@ class DeckLinkPanelController: NSWindowController {
           let mode = DeckLinkScaling(rawValue: raw) else { return }
     DeckLinkController.shared.setScaling(mode)
     refresh()
+  }
+
+  @objc private func saveTrace(_ sender: NSButton) {
+    if let url = DeckLinkController.shared.saveTrace() {
+      statusLabel.stringValue = "trace written to \(url.lastPathComponent)"
+    } else {
+      statusLabel.stringValue = "could not write the trace"
+    }
   }
 
   @objc private func flipFields(_ sender: NSButton) {

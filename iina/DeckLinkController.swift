@@ -173,6 +173,36 @@ class DeckLinkController {
   /// field rate; anything else means the cadence phase has slipped.
   var mixedFrames: Int { tap.mixedFrames }
 
+  /// Write the trace ring somewhere the user can find and send it.
+  ///
+  /// Release builds only ever have the panel, so the dump has to be a button rather than a debugger
+  /// or a debug configuration. Goes to the same folder IINA already uses for logs.
+  @discardableResult
+  func saveTrace() -> URL? {
+    let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)
+      .first?.appendingPathComponent("Logs/IINA", isDirectory: true)
+    guard let dir = dir else { return nil }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let stamp = ISO8601DateFormatter().string(from: Date())
+      .replacingOccurrences(of: ":", with: "-")
+    let url = dir.appendingPathComponent("decklink-trace-\(stamp).csv")
+    // A header of the settings, so a trace is readable months later without the screenshot that
+    // went with it.
+    var text = "# mode=\(selectedMode?.name ?? "?") fields=\(fieldMode) order=\(fieldOrder)"
+    text += " cadence=\(filmCadence) engaged=\(cadenceEngaged) lowLatency=\(lowLatency)"
+    text += " renderAtOutput=\(renderAtOutputResolution) source=\(sourceFrameRate)"
+    text += " holds=\(cadenceHolds) mixed=\(mixedFrames) dup=\(duplicateFrames)\n"
+    text += tap.traceCSV()
+    do {
+      try text.write(to: url, atomically: true, encoding: .utf8)
+      NSWorkspace.shared.activateFileViewerSelecting([url])
+      return url
+    } catch {
+      Logger.log("DeckLink: could not write trace: \(error)", level: .error)
+      return nil
+    }
+  }
+
   /// Frames the card was handed twice, which nothing counted before.
   var duplicateFrames: Int { tap.duplicatesOut }
 
