@@ -172,6 +172,10 @@ class DeckLinkController {
   /// Frame rate of the file being shown, as the tap last saw it.
   var sourceFrameRate: Double { tap.sourceRate }
 
+  /// What mpv reports against what the draw loop actually delivers. They disagree on soft telecined
+  /// files, where container-fps is the display rate rather than the frames handed over.
+  var sourceRates: (reported: Double, effective: Double) { tap.reportedVersusObserved }
+
   /// Height of the decoded video, and whether mpv is deinterlacing. Both matter only for
   /// `sourceInterlaced`, and both silently ruin it, which is why they are polled and reported.
   ///

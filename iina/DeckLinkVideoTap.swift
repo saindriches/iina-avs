@@ -129,11 +129,43 @@ final class DeckLinkVideoTap {
   /// every field, which is plain field-rate interlace.
   private var cadenceAcc: Double = 0
 
+  /// The source rate to plan against, which is not always the one mpv reports.
+  ///
+  /// A soft telecined file holds 23.976 progressive frames plus flags saying which occupy three
+  /// field times, and container-fps commonly reports the DISPLAY rate those flags produce, 29.97,
+  /// rather than the 23.976 frames actually delivered. Believing that makes the cadence plan a flat
+  /// 2:2 for a stream that needs 3:2, and the frames that never arrive come out as holds: repeats
+  /// at irregular intervals, which is worse judder than the clean 24p file it should have matched.
+  ///
+  /// The draw loop cannot lie about this. It runs when mpv has a new frame, so its rate is the
+  /// number of distinct moments actually on offer, and we can never build more than that however
+  /// many the container claims. Taking the lower of the two is therefore correct by construction
+  /// rather than a heuristic.
+  ///
+  /// Guarded on both sides: only believed when it is materially lower and not absurdly so, since a
+  /// window that is occluded or a machine that is briefly busy should not rewrite the cadence.
+  private var effectiveSourceRateLocked: Double {
+    guard sourceFrameRate > 0 else { return sourceFrameRate }
+    guard hookIntervalEMA > 0 else { return sourceFrameRate }
+    let observed = 1.0 / hookIntervalEMA
+    guard observed < sourceFrameRate * 0.95, observed > sourceFrameRate * 0.2 else {
+      return sourceFrameRate
+    }
+    return observed
+  }
+
+  /// What the panel should show when the two disagree, so the reason is visible rather than magic.
+  var reportedVersusObserved: (reported: Double, effective: Double) {
+    lock.lock()
+    defer { lock.unlock() }
+    return (sourceFrameRate, effectiveSourceRateLocked)
+  }
+
   /// Source frames per field slot, never above 1: a source cannot supply more distinct moments than
   /// it has frames. Caller holds `lock`.
   private var cadenceRatioLocked: Double {
     guard fieldRate > 0 else { return 1 }
-    return min(1.0, sourceFrameRate / fieldRate)
+    return min(1.0, effectiveSourceRateLocked / fieldRate)
   }
 
   /// Whether the cadence can run: asked for, weaving, and a source no faster than the field rate.
@@ -145,7 +177,7 @@ final class DeckLinkVideoTap {
   /// were silently never shown and which twenty was arbitrary.
   private var cadenceEngagedLocked: Bool {
     guard !sourceInterlaced, filmCadence, weaveFields, sourceFrameRate > 0, fieldRate > 0 else { return false }
-    return sourceFrameRate <= fieldRate * 1.01
+    return effectiveSourceRateLocked <= fieldRate * 1.01
   }
 
   /// Advance one field slot. True when the slot crosses into the next source frame.
@@ -557,7 +589,7 @@ final class DeckLinkVideoTap {
       rate = frameRate
     } else if cadenceEngagedLocked {
       // One capture per source frame: the cadence spreads them across the fields itself.
-      rate = sourceFrameRate
+      rate = effectiveSourceRateLocked
     } else if weaveStarvedLocked {
       // Whole frames, sampled at the OUTPUT rate rather than the source's.
       //

@@ -544,8 +544,16 @@ class DeckLinkPanelController: NSWindowController {
     if dl.cadenceEngaged {
       // One capture per SOURCE frame: the cadence builds the fields itself.
       needed = dl.sourceFrameRate
-      build = String(format: "cadence %.2f fps into %.2f fields, %ld holds",
-                     dl.sourceFrameRate, fieldRate, dl.cadenceHolds)
+      let rates = dl.sourceRates
+      if abs(rates.reported - rates.effective) > 0.05 {
+        // Say both, because a cadence planned against a rate the file did not mean is exactly the
+        // case worth seeing, and it is invisible otherwise.
+        build = String(format: "cadence %.2f fps (file says %.2f), %ld holds",
+                       rates.effective, rates.reported, dl.cadenceHolds)
+      } else {
+        build = String(format: "cadence %.2f fps into %.2f fields, %ld holds",
+                       rates.effective, fieldRate, dl.cadenceHolds)
+      }
     } else if dl.weaveStarved {
       // Only as many distinct moments a second as the source has frames, so field-rate motion
       // cannot be made however it is sampled.
