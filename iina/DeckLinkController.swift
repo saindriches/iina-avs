@@ -169,6 +169,12 @@ class DeckLinkController {
   /// Times the cadence wanted a film frame and had none. Should stay at zero.
   var cadenceHolds: Int { tap.cadenceHolds }
 
+  /// Frames the card was handed twice, which nothing counted before.
+  var duplicateFrames: Int { tap.duplicatesOut }
+
+  /// Whether the one line shift is really being applied.
+  var isSwappingFields: Bool { tap.isSwappingFields }
+
   /// Frame rate of the file being shown, as the tap last saw it.
   var sourceFrameRate: Double { tap.sourceRate }
 

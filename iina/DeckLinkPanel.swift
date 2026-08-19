@@ -587,9 +587,9 @@ class DeckLinkPanelController: NSWindowController {
         let placement = dl.linePlacement
         note = String(format: "source fields, %ld placed in %ld at line %ld%@",
                       placement.height, mode.height, placement.top,
-                      dl.fieldOrder == .lowerFirst ? ", swapped" : "")
-      } else if dl.fieldOrder == .lowerFirst {
-        note = "source fields, swapped"
+                      dl.isSwappingFields ? ", swapped" : "")
+      } else if dl.isSwappingFields {
+        note = "source fields, shifted one line"
       }
       build = note
     } else if weaving {
@@ -613,9 +613,9 @@ class DeckLinkPanelController: NSWindowController {
     lines.append(delay)
 
     // -- count. Scheduled is context; the rest should all be zero.
-    lines.append(String(format: "count   sent %ld, late %ld, dropped %ld, repeat %ld, resync %ld",
+    lines.append(String(format: "count   sent %ld, late %ld, drop %ld, rep %ld, dup %ld, resync %ld",
                         dl.scheduledFrames, dl.lateFrames, dl.droppedFrames,
-                        dl.repeatCount, dl.resyncCount))
+                        dl.repeatCount, dl.duplicateFrames, dl.resyncCount))
     return lines.joined(separator: "\n")
   }
 

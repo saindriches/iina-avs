@@ -156,6 +156,24 @@ final class DeckLinkVideoTap {
   private static let filmQueueDepth = 4
   private var current = [UInt8]()
   private var previous = [UInt8]()
+  /// Whether the one line shift is actually being applied, as opposed to merely asked for. The two
+  /// differ whenever the chosen source order already matches the raster, and the status line was
+  /// reporting the request rather than the result.
+  var isSwappingFields: Bool { swapSourceFields }
+
+  /// Frames handed to the card that were the same picture as the one before.
+  ///
+  /// Nothing counted these on the low latency path, so a repeat was invisible in the stats. It is
+  /// the expected cost of two unlocked clocks: our capture follows the Mac's display and mpv, the
+  /// card follows its own crystal, and 0.1% between them is a duplicate every seventeen seconds or
+  /// so. Harmless in PsF, where it is one frame of hesitation in progressive content, and obvious
+  /// in a real field-rate picture, where it stalls two fields of genuine motion.
+  private(set) var duplicatesOut = 0
+  /// Bumped whenever a genuinely new picture is published, so the consumer can tell a fresh frame
+  /// from the same one handed out twice.
+  private var publishSerial = 0
+  private var lastHandedSerial = -1
+
   /// Times the cycle wanted a film frame and had none. Should sit at zero: anything else means
   /// capture is not keeping up with the card and the cadence is being held rather than run.
   private(set) var cadenceHolds = 0
@@ -609,6 +627,9 @@ final class DeckLinkVideoTap {
     frameComplete = !weaveFields
     capturedFrames = 0
     publishedFrames = 0
+    duplicatesOut = 0
+    publishSerial = 0
+    lastHandedSerial = -1
     hookCalls = 0
     nextSampleAt = 0
     hookIntervalEMA = 0
@@ -794,6 +815,7 @@ final class DeckLinkVideoTap {
       frameComplete = true
       swap(&working, &published)
       hasFrame = true
+      publishSerial &+= 1
       capturedFrames += 1
       publishedFrames += 1
       return
@@ -847,6 +869,7 @@ final class DeckLinkVideoTap {
     // finished and takes back the one it had, to assemble the next pair in.
     swap(&working, &published)
     hasFrame = true
+    publishSerial &+= 1
     publishedFrames += 1
   }
 
@@ -1049,6 +1072,7 @@ final class DeckLinkVideoTap {
             }
           }
           hasFrame = true
+          publishSerial &+= 1
           capturedFrames += 1
           publishedFrames += 1
         }
@@ -1212,8 +1236,10 @@ final class DeckLinkVideoTap {
     if cadenceEngagedLocked, current.count == width * height * 4 {
       composeCadenceFrame(into: destination, width: width, height: height, stride: stride)
       publishedFrames += 1
-      return true
+      return true   // the cadence builds a new frame every time, so it can never be a duplicate
     }
+
+    if publishSerial == lastHandedSerial { duplicatesOut += 1 } else { lastHandedSerial = publishSerial }
 
     guard published.count == width * height * 4 else { return false }
     let rowBytes = width * 4
