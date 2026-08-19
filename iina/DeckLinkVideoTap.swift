@@ -849,8 +849,13 @@ final class DeckLinkVideoTap {
                          destWidth: screenWidth, destHeight: screenHeight)
     scaling = previewScaling
 
+    // Leave the viewport describing the SCREEN, not whatever it was on entry. Restoring the value
+    // read at the top perpetuated a wrong one: mpv sets the viewport to the raster size while
+    // rendering into our target, so if the entry value had already been corrupted, every later pass
+    // faithfully restored the corruption.
     glBindFramebuffer(GLenum(GL_FRAMEBUFFER), screenFBO)
-    glViewport(prevViewport[0], prevViewport[1], GLsizei(prevViewport[2]), GLsizei(prevViewport[3]))
+    glViewport(0, 0, GLsizei(screenWidth), GLsizei(screenHeight))
+    _ = prevViewport
     while glGetError() != GLenum(GL_NO_ERROR) {}
     return true
   }

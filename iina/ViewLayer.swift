@@ -198,11 +198,21 @@ class ViewLayer: CAOpenGLLayer {
 
           // Output-first mode renders once at the SDI resolution and previews that to the window,
           // so skip the normal on-screen render entirely when it takes over.
+          //
+          // The size comes from the LAYER, not from GL_VIEWPORT. The viewport is shared state that
+          // the SDI pass itself changes (mpv sets it to the raster size while rendering into the
+          // offscreen target), and the restore path read its "previous" value from the same place,
+          // so one bad reading kept restoring itself. What that looked like was the preview drawn
+          // at 1920x1080 pixels in the lower-left corner of the window, half size on a 2x display,
+          // appearing at random and then persisting. bounds times contentsScale cannot drift.
+          let scale = contentsScale
+          let layerWidth = Int((bounds.width * scale).rounded())
+          let layerHeight = Int((bounds.height * scale).rounded())
           if DeckLinkController.shared.renderForOutput(for: videoView.player,
                                                        renderContext: context,
                                                        screenFBO: GLuint(fbo),
-                                                       screenWidth: Int(dims[2]),
-                                                       screenHeight: Int(dims[3])) {
+                                                       screenWidth: layerWidth > 0 ? layerWidth : Int(dims[2]),
+                                                       screenHeight: layerHeight > 0 ? layerHeight : Int(dims[3])) {
             return
           }
 
