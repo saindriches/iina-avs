@@ -779,7 +779,15 @@ class DeckLinkController {
     // filter, since the filter averages the rows either side of each line and those rows are the
     // other field.
     tap.sourceInterlaced = mode.isInterlaced && fieldMode == .sourceInterlaced
-    tap.swapSourceFields = fieldOrder == .lowerFirst
+    // In pass-through the setting names the SOURCE's field order, and a shift is needed only when
+    // that disagrees with the raster's. Wiring it as "lowerFirst means swap" was wrong wherever the
+    // card is already lower first, which NTSC is: Auto and Upper then both did nothing, and the
+    // only option that shifted was the one naming the order Auto had already reported.
+    if fieldOrder == .auto {
+      tap.swapSourceFields = false        // assume the source agrees with the raster
+    } else {
+      tap.swapSourceFields = (fieldOrder == .upperFirst) != mode.upperFieldFirst
+    }
     // Immediate readback is synchronous, so it stalls the GL thread until the GPU is done. Weaving
     // already needs twice as many readbacks, and at field rate that stall is what stops the pair
     // completing in time, which the card then shows as a dropped field. Low Latency keeps its

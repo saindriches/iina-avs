@@ -422,7 +422,7 @@ class DeckLinkPanelController: NSWindowController {
       && (dl.fieldMode == .trueInterlace || dl.fieldMode == .sourceInterlaced)
     fieldOrderPopUp.toolTip = dl.fieldMode == .sourceInterlaced
       ? NSLocalizedString("menu.decklink_field_order_src_tip",
-                          value: "The fields are already committed to their lines here, so the only lever is to shift the picture one line and exchange them. Use Lower Field First when the source was encoded with the opposite dominance to the raster.",
+                          value: "Which field the SOURCE was encoded with first. The card splits the frame by row parity, so when the source disagrees with the raster the picture is shifted one line, which exchanges the two fields without visibly moving anything. Auto assumes the source agrees with the raster.",
                           comment: "")
       : NSLocalizedString("menu.decklink_field_order_tip2",
                           value: "Which field the card transmits first, and so which one carries the earlier moment.",
