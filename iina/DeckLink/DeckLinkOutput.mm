@@ -602,7 +602,15 @@ private:
       BMDTimeValue target = (lastIndex < 0) ? index + 1 : lastIndex + 1;
       if (target <= index) target = index + 1;
       lastIndex = target;
-      const BMDTimeValue due = target * ticks - ticks / 4;
+      // Half a frame of headroom, not a quarter. The work between waking and displaying is a
+      // provider call plus a full pack, and packing 1920x1080 measured about 7.65 ms against the
+      // 8.34 ms that a quarter frame gives at 29.97: under a millisecond of margin. Landing past
+      // the boundary pushes the frame to the next one and the loop then resyncs by skipping a beat,
+      // which is a visible step in field-rate content and nothing at all in PsF. Restarting the
+      // device re-randomised the phase, which is why toggling Low Latency appeared to help and then
+      // stopped helping. Half a frame leaves twice the measured cost, and displaying early is free
+      // because the card holds the frame until its boundary anyway.
+      const BMDTimeValue due = target * ticks - ticks / 2;
       if (due > hw) wait = std::chrono::nanoseconds(((due - hw) * 1000000000LL) / timeScale_);
     } else {
       // No clock to follow (card stopped, or the call refused): fall back to one frame of sleep so
