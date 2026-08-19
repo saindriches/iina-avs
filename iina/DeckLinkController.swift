@@ -539,6 +539,20 @@ class DeckLinkController {
     reconfigureTapIfRunning()
   }
 
+  /// Swap to the other field order, whichever it currently is.
+  ///
+  /// Nothing here can work out which pairing the content wants, so the answer lives with whoever is
+  /// looking at the monitor. That makes this a one-press question rather than a setting: press,
+  /// look, press back if it was worse. It resolves to an explicit order rather than Auto, since
+  /// Auto means "assume the source agrees" and is therefore one of the two states already.
+  func flipFieldOrder() {
+    guard let mode = selectedMode else { return }
+    let cardUpper = mode.upperFieldFirst
+    let wantSwap = !isSwappingFields
+    let sourceUpper = wantSwap ? !cardUpper : cardUpper
+    setFieldOrder(sourceUpper ? .upperFirst : .lowerFirst)
+  }
+
   func setFieldOrder(_ order: DeckLinkFieldOrder) {
     guard order != fieldOrder else { return }
     fieldOrder = order

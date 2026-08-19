@@ -184,6 +184,13 @@ final class DeckLinkVideoTap {
   /// That costs a single dropped moment against an inversion that would otherwise last a minute.
   private var sourceConsumed = 0
   private var pairingNeedsCatchUp = false
+  /// Which parity of the consumed count is the RIGHT one.
+  ///
+  /// Locking to even was wrong on its own: nothing here can know which of the two pairings the
+  /// content wants, so a lock that always chooses even makes a wrong start permanent, where before
+  /// it would at least have flipped back eventually. The choice belongs to whoever can see the
+  /// picture, so Field Order selects it and the lock then holds whatever was selected.
+  private var pairingParityTarget: Int { swapSourceFields ? 1 : 0 }
   /// Only meaningful when two source frames make one output frame. Other ratios have no fixed
   /// pairing parity to preserve, so forcing one would drop frames for nothing.
   private var pairingParityMatters: Bool { abs(cadenceRatioLocked - 1.0) < 0.02 }
@@ -286,7 +293,9 @@ final class DeckLinkVideoTap {
       // either way, and two frames of queue cannot cover that. Sizing by measurement beats sizing
       // by guess, since the right depth depends on the source and the panel, not on us.
       filmQueueDepth = min(Self.filmQueueCeiling, filmQueueDepth + 1)
-      if pairingParityMatters, sourceConsumed % 2 != 0 { pairingNeedsCatchUp = true }
+      if pairingParityMatters, sourceConsumed % 2 != pairingParityTarget {
+        pairingNeedsCatchUp = true
+      }
       // Re-anchoring the phase is right for an ISOLATED hold, where the cycle has genuinely lost
       // the source and would otherwise stay offset until someone toggled a setting. It is wrong
       // when holds are chronic, which was the case here at more than one a second: resetting that

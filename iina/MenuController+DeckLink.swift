@@ -361,6 +361,12 @@ extension MenuController {
                                           value: "The SDI picture reaches the monitor later than the window does, but the audio does not, so anything watched on the monitor drifts by exactly that. This holds mpv's audio delay at the measured video latency. It is put back as it was when output stops.",
                                           comment: "")
 
+    let flip = menu.addItem(withTitle: NSLocalizedString("menu.decklink_flip_fields",
+                                                        value: "Flip Fields", comment: ""),
+                            action: #selector(menuDeckLinkFlipFields(_:)), keyEquivalent: "")
+    flip.target = self
+    flip.isEnabled = orderEnabled
+
     let twitter = menu.addItem(withTitle: NSLocalizedString("menu.decklink_interline",
                                                              value: "Interline Filter", comment: ""),
                                action: #selector(menuDeckLinkToggleInterlineFilter(_:)), keyEquivalent: "")
@@ -443,6 +449,10 @@ extension MenuController {
 
   @objc func menuDeckLinkToggleFilmCadence(_ sender: NSMenuItem) {
     DeckLinkController.shared.setFilmCadence(sender.state != .on)
+  }
+
+  @objc func menuDeckLinkFlipFields(_ sender: NSMenuItem) {
+    DeckLinkController.shared.flipFieldOrder()
   }
 
   @objc func menuDeckLinkSelectFieldOrder(_ sender: NSMenuItem) {

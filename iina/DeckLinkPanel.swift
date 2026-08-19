@@ -50,6 +50,7 @@ class DeckLinkPanelController: NSWindowController {
   private var fieldPopUp: NSPopUpButton!
   private var fieldOrderPopUp: NSPopUpButton!
   private var scalingPopUp: NSPopUpButton!
+  private var flipFieldsButton: NSButton!
   private var interlineBox: NSButton!
   private var filmCadenceBox: NSButton!
   private var testPatternPopUp: NSPopUpButton!
@@ -134,6 +135,15 @@ class DeckLinkPanelController: NSWindowController {
     fieldOrderPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_field_order",
                                                           value: "Field Order", comment: ""),
                              action: #selector(selectFieldOrder(_:)))
+
+    flipFieldsButton = NSButton(title: NSLocalizedString("menu.decklink_flip_fields",
+                                                        value: "Flip Fields", comment: ""),
+                                target: self, action: #selector(flipFields(_:)))
+    flipFieldsButton.bezelStyle = .rounded
+    flipFieldsButton.toolTip = NSLocalizedString("menu.decklink_flip_fields_tip",
+                                                 value: "Swap to the other field order. Nothing here can work out which one the content wants, so press it, look at the monitor, and press it back if it was worse.",
+                                                 comment: "")
+    stack.addArrangedSubview(flipFieldsButton)
 
     filmCadenceBox = addCheck(to: stack, NSLocalizedString("menu.decklink_film_cadence",
                                                             value: "Pulldown Cadence", comment: ""),
@@ -434,6 +444,7 @@ class DeckLinkPanelController: NSWindowController {
                                                value: "Spread a source slower than the field rate across the fields, generated on the card's clock rather than resampled from the window. 23.976 film into 59.94 fields gives the 2:3 of telecine, 50p gives 5:6, 30p a clean two fields each. Needs True Interlace. Works on either latency path, since both are now paced by the card.",
                                                comment: "")
 
+    flipFieldsButton.isEnabled = fieldOrderPopUp.isEnabled
     interlineBox.state = dl.interlineFilter ? .on : .off
     interlineBox.isEnabled = dl.selectedMode?.isInterlacedOrPsF ?? false
 
@@ -678,6 +689,11 @@ class DeckLinkPanelController: NSWindowController {
     guard let raw = sender.selectedItem?.representedObject as? Int,
           let mode = DeckLinkScaling(rawValue: raw) else { return }
     DeckLinkController.shared.setScaling(mode)
+    refresh()
+  }
+
+  @objc private func flipFields(_ sender: NSButton) {
+    DeckLinkController.shared.flipFieldOrder()
     refresh()
   }
 
