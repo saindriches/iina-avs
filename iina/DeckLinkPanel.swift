@@ -570,7 +570,13 @@ class DeckLinkPanelController: NSWindowController {
       // Scaling is the brutal one: resampling vertically averages each line with the other field,
       // and once that has happened nothing downstream can take them apart again.
       var note = "source fields, passing through"
-      if dl.sourceDeinterlacing {
+      if !dl.renderAtOutputResolution {
+        // The most destructive of the three and the easiest to miss. Without this the picture is
+        // taken from the WINDOW's framebuffer, so the window's height sets the vertical resolution
+        // and the rescale to the raster averages every line with the other field. The fields are
+        // gone before the tap ever sees them, and nothing downstream can recover them.
+        note = "source fields NEED Render at Output Resolution"
+      } else if dl.sourceDeinterlacing {
         note = "source fields, but mpv is DEINTERLACING"
       } else if dl.sourceHeight > 0 && dl.sourceHeight != mode.height {
         note = String(format: "source fields, but %ld is being scaled to %ld",
