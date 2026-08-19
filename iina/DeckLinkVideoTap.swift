@@ -252,7 +252,18 @@ final class DeckLinkVideoTap {
 
   /// Move on to the next source frame, or record that there was not one to move to.
   private func pullCadenceFrame() {
-    guard !filmReady.isEmpty else { cadenceHolds += 1; return }
+    guard !filmReady.isEmpty else {
+      cadenceHolds += 1
+      // A hold means the cycle has lost its relationship with the source: it wanted the next frame
+      // and there was not one. Carrying on leaves the phase wherever the stall happened to put it,
+      // and since nothing pulls it back, a single hold can leave the pairing offset for good. That
+      // is why re-arming the tap fixed the field order and why ANY setting that re-arms it worked,
+      // the interline filter included, in either direction. Re-anchor here instead, so the cycle
+      // recovers by itself rather than waiting for someone to toggle something.
+      cadenceAcc = 0
+      fieldParity = 0
+      return
+    }
     filmSpare.append(previous)
     previous = current
     current = filmReady.removeFirst()
