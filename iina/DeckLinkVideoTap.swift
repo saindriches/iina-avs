@@ -96,8 +96,13 @@ final class DeckLinkVideoTap {
   private var filmCadence = false
   /// Frame rate mpv reports for the file. Zero when unknown.
   private var sourceFrameRate: Double = 0
-  /// Field rate of the mode, so the cadence can check the source really is 2/5 of it.
+  /// Field rate of the mode, for the cadence and the weaving checks. Only the FIELD rate while
+  /// weaving; without weaving there is one sample per frame and this holds the frame rate, which is
+  /// why anything wanting the frame rate must use `frameRate` and not halve this.
   private var fieldRate: Double = 0
+  /// The mode's frame rate, always. Kept separately because deriving it from `fieldRate` is only
+  /// correct in one of the two cases, and getting that wrong halved the pass-through sample rate.
+  private var frameRate: Double = 0
 
   /// Film frames waiting to be shown, oldest first, and buffers to read the next one back into.
   ///
@@ -502,6 +507,7 @@ final class DeckLinkVideoTap {
     self.filmCadence = filmCadence
     self.sourceFrameRate = sourceFrameRate
     fieldRate = weaveFields ? fps * 2.0 : fps
+    frameRate = fps
     fieldParity = 0
     cadenceAcc = 0
     // Keep the last picture across a re-arm when the raster has not changed. Re-allocating zeroed
@@ -548,7 +554,7 @@ final class DeckLinkVideoTap {
     let rate: Double
     if sourceInterlaced {
       // One capture per output frame: each source frame IS an output frame here.
-      rate = fieldRate / 2.0
+      rate = frameRate
     } else if cadenceEngagedLocked {
       // One capture per source frame: the cadence spreads them across the fields itself.
       rate = sourceFrameRate
@@ -561,7 +567,7 @@ final class DeckLinkVideoTap {
       // the twenty that went missing were an arbitrary twenty. Below it, the card was left to
       // repeat whatever it still had. Sampling at the output rate makes the drop or the repeat
       // regular, which is the ordinary frame-rate conversion this case should have been doing.
-      rate = fieldRate / 2.0
+      rate = frameRate
     } else {
       rate = fieldRate
     }
