@@ -45,6 +45,18 @@ final class DeckLinkVideoTap {
   private var weaveFields = false
   /// Which field is transmitted first, and so carries the earlier sample.
   private var upperFieldFirst = true
+
+  /// The source frames already contain both fields, so hand them over untouched.
+  ///
+  /// Every other mode here BUILDS an interlaced frame out of progressive samples. This one must
+  /// build nothing: the two moments are already interleaved in the rows, and anything that mixes
+  /// rows destroys them. So no weaving, no cadence, no filter, and no vertical resampling upstream
+  /// either, which is the one precondition the tap cannot enforce for itself.
+  var sourceInterlaced = false
+  /// Shift the picture one line, exchanging which rows land in which field. The only lever there is
+  /// when the source was encoded with the opposite dominance to the raster, since the fields are
+  /// already committed to their lines and nothing else can reorder them.
+  var swapSourceFields = false
   /// 0 = waiting for the earlier field, 1 = waiting for the later one.
   private var fieldParity = 0
 
@@ -124,7 +136,7 @@ final class DeckLinkVideoTap {
   /// fallback, and published 50 frames a second at a card taking 29.97, so twenty of them a second
   /// were silently never shown and which twenty was arbitrary.
   private var cadenceEngagedLocked: Bool {
-    guard filmCadence, weaveFields, sourceFrameRate > 0, fieldRate > 0 else { return false }
+    guard !sourceInterlaced, filmCadence, weaveFields, sourceFrameRate > 0, fieldRate > 0 else { return false }
     return sourceFrameRate <= fieldRate * 1.01
   }
 
@@ -163,7 +175,7 @@ final class DeckLinkVideoTap {
   /// cadence, which keeps every source moment by spreading them over the fields, so it only applies
   /// when the cadence is off. Caller holds `lock`.
   private var weaveStarvedLocked: Bool {
-    guard weaveFields, !cadenceEngagedLocked, sourceFrameRate > 0, fieldRate > 0 else { return false }
+    guard !sourceInterlaced, weaveFields, !cadenceEngagedLocked, sourceFrameRate > 0, fieldRate > 0 else { return false }
     return sourceFrameRate < fieldRate * 0.9
   }
 
@@ -529,7 +541,10 @@ final class DeckLinkVideoTap {
   /// Caller holds `lock`.
   private func updateSampleIntervalLocked() {
     let rate: Double
-    if cadenceEngagedLocked {
+    if sourceInterlaced {
+      // One capture per output frame: each source frame IS an output frame here.
+      rate = fieldRate / 2.0
+    } else if cadenceEngagedLocked {
       // One capture per source frame: the cadence spreads them across the fields itself.
       rate = sourceFrameRate
     } else if weaveStarvedLocked {
@@ -646,6 +661,33 @@ final class DeckLinkVideoTap {
       hasFrame = true
       frameComplete = true
       capturedFrames += 1
+      return
+    }
+
+    // Pass-through: copy the frame as it came, optionally shifted a line. Every row moves, so the
+    // fields the encoder wrote are the fields the card transmits.
+    if sourceInterlaced {
+      working.withUnsafeMutableBytes { raw in
+        guard let dstBase = raw.baseAddress else { return }
+        if swapSourceFields {
+          // One line down: row 0 takes source row 1, so what was the upper field becomes the lower.
+          // The last row has nothing above it to take and keeps what it had, which is one line of
+          // the wrong field at the very bottom of the raster, past anything a tube shows.
+          for y in 0..<h {
+            let from = min(h - 1, y + 1)
+            memcpy(dstBase.advanced(by: y * rowBytes), src.advanced(by: from * rowBytes), rowBytes)
+          }
+        } else {
+          memcpy(dstBase, src, rowBytes * h)
+        }
+        drawTestPattern(dstBase, width: w, height: h, startRow: 0, everyOtherRow: false)
+      }
+      if testPattern != .off { testStep += 1 }
+      frameComplete = true
+      swap(&working, &published)
+      hasFrame = true
+      capturedFrames += 1
+      publishedFrames += 1
       return
     }
 

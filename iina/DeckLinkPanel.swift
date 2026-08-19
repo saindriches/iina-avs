@@ -390,6 +390,7 @@ class DeckLinkPanelController: NSWindowController {
     let fieldModes: [(DeckLinkFieldMode, String)] = [
       (.psf, NSLocalizedString("menu.decklink_field_psf", value: "PsF (whole frames)", comment: "")),
       (.trueInterlace, NSLocalizedString("menu.decklink_field_true", value: "True Interlace (field-rate)", comment: "")),
+      (.sourceInterlaced, NSLocalizedString("menu.decklink_field_source", value: "Source Fields (pass through)", comment: "")),
     ]
     fieldPopUp.removeAllItems()
     for (value, title) in fieldModes {
@@ -417,7 +418,15 @@ class DeckLinkPanelController: NSWindowController {
     if let index = fieldOrders.firstIndex(where: { $0.0 == dl.fieldOrder }) {
       fieldOrderPopUp.selectItem(at: index)
     }
-    fieldOrderPopUp.isEnabled = interlacedRaster && dl.fieldMode == .trueInterlace
+    fieldOrderPopUp.isEnabled = interlacedRaster
+      && (dl.fieldMode == .trueInterlace || dl.fieldMode == .sourceInterlaced)
+    fieldOrderPopUp.toolTip = dl.fieldMode == .sourceInterlaced
+      ? NSLocalizedString("menu.decklink_field_order_src_tip",
+                          value: "The fields are already committed to their lines here, so the only lever is to shift the picture one line and exchange them. Use Lower Field First when the source was encoded with the opposite dominance to the raster.",
+                          comment: "")
+      : NSLocalizedString("menu.decklink_field_order_tip2",
+                          value: "Which field the card transmits first, and so which one carries the earlier moment.",
+                          comment: "")
 
     filmCadenceBox.state = dl.filmCadence ? .on : .off
     filmCadenceBox.isEnabled = dl.filmCadenceAvailable
@@ -548,6 +557,20 @@ class DeckLinkPanelController: NSWindowController {
       let short = dl.sourceFrameRate < mode.fps
       build = String(format: "whole frames %.2f from %.2f, %@",
                      mode.fps, dl.sourceFrameRate, short ? "repeating" : "dropping")
+    } else if dl.fieldMode == .sourceInterlaced && mode.isInterlaced {
+      // Both preconditions are invisible from the picture until motion combs wrongly, so say them.
+      // Scaling is the brutal one: resampling vertically averages each line with the other field,
+      // and once that has happened nothing downstream can take them apart again.
+      var note = "source fields, passing through"
+      if dl.sourceDeinterlacing {
+        note = "source fields, but mpv is DEINTERLACING"
+      } else if dl.sourceHeight > 0 && dl.sourceHeight != mode.height {
+        note = String(format: "source fields, but %ld is being scaled to %ld",
+                      dl.sourceHeight, mode.height)
+      } else if dl.fieldOrder == .lowerFirst {
+        note = "source fields, swapped"
+      }
+      build = note
     } else if weaving {
       build = "field-rate interlace"
     } else if mode.isInterlacedOrPsF {

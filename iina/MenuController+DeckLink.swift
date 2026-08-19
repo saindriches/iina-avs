@@ -290,6 +290,7 @@ extension MenuController {
     let fieldModes: [(DeckLinkFieldMode, String)] = [
       (.psf, NSLocalizedString("menu.decklink_field_psf", value: "PsF (whole frames)", comment: "")),
       (.trueInterlace, NSLocalizedString("menu.decklink_field_true", value: "True Interlace (field-rate)", comment: "")),
+      (.sourceInterlaced, NSLocalizedString("menu.decklink_field_source", value: "Source Fields (pass through)", comment: "")),
     ]
     for (value, title) in fieldModes {
       let item = fieldMenu.addItem(withTitle: title,

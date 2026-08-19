@@ -43,6 +43,15 @@ enum DeckLinkFieldMode: Int {
   /// Each field is its own moment, a field period apart, which is what a CRT's scan actually shows.
   /// Only buys anything when the source itself carries motion at the field rate.
   case trueInterlace = 1
+  /// The source frames ALREADY hold two fields, woven together by whoever encoded them. Broadcast
+  /// material published as progressive, and most bad rips of it, look like this: every frame combs
+  /// on motion because its odd and even lines are different moments.
+  ///
+  /// Nothing needs building for these, and building anything is destructive. Pass the frame through
+  /// untouched and the card splits it by row parity, which recovers exactly the fields that were
+  /// encoded. mpv never hands out fields, only frames, so this is the only way to get genuinely
+  /// interlaced content back out as interlace.
+  case sourceInterlaced = 2
 }
 
 /// Patterns that answer a question the picture cannot.
@@ -162,6 +171,22 @@ class DeckLinkController {
 
   /// Frame rate of the file being shown, as the tap last saw it.
   var sourceFrameRate: Double { tap.sourceRate }
+
+  /// Height of the decoded video, and whether mpv is deinterlacing. Both matter only for
+  /// `sourceInterlaced`, and both silently ruin it, which is why they are polled and reported.
+  ///
+  /// Any vertical resampling blends adjacent lines, and adjacent lines are the two different
+  /// moments this mode exists to keep apart: a 2160p source scaled to a 1080 raster arrives with
+  /// its fields already averaged together and nothing downstream can separate them again. A
+  /// deinterlacer does the same thing deliberately.
+  private(set) var sourceHeight = 0
+  private(set) var sourceDeinterlacing = false
+
+  /// True when the source can actually survive being passed through as fields.
+  var sourceInterlaceClean: Bool {
+    guard let mode = selectedMode else { return false }
+    return sourceHeight == mode.height && !sourceDeinterlacing
+  }
 
   /// Frames sitting in the card, from the driver.
   var bufferedFrames: Int { output.bufferedFrames }
@@ -587,12 +612,25 @@ class DeckLinkController {
     return fps.isFinite && fps > 0 ? fps : 0
   }
 
+  /// Read what would quietly break a field passthrough. Main thread, once a second, same as the
+  /// rate: these only change when the file or a filter does.
+  private func refreshSourceGeometry() {
+    guard let player = routedPlayer, player.info.state.loaded, let mpv = player.mpv else {
+      sourceHeight = 0
+      sourceDeinterlacing = false
+      return
+    }
+    sourceHeight = mpv.getInt(MPVProperty.videoParamsH)
+    sourceDeinterlacing = mpv.getFlag(MPVOption.Video.deinterlace)
+  }
+
   private func startSourceRateTimer() {
     sourceRateTimer?.invalidate()
     tap.updateSourceFrameRate(routedSourceFrameRate())
     let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
       guard let self = self else { return }
       self.tap.updateSourceFrameRate(self.routedSourceFrameRate())
+      self.refreshSourceGeometry()
       let now = self.estimatedLatency
       self.smoothedLatency = self.smoothedLatency > 0 ? self.smoothedLatency * 0.7 + now * 0.3 : now
       self.updateAudioCompensation()
@@ -687,6 +725,11 @@ class DeckLinkController {
   /// additionally needs the card to clock the consumer, so it is off the low-latency path.
   private func armTap(for mode: DeckLinkMode) {
     let weave = mode.isInterlaced && fieldMode == .trueInterlace
+    // Pass-through wants the frame exactly as decoded: no weaving, no cadence, and above all no
+    // filter, since the filter averages the rows either side of each line and those rows are the
+    // other field.
+    tap.sourceInterlaced = mode.isInterlaced && fieldMode == .sourceInterlaced
+    tap.swapSourceFields = fieldOrder == .lowerFirst
     // Immediate readback is synchronous, so it stalls the GL thread until the GPU is done. Weaving
     // already needs twice as many readbacks, and at field rate that stall is what stops the pair
     // completing in time, which the card then shows as a dropped field. Low Latency keeps its
@@ -696,7 +739,8 @@ class DeckLinkController {
     tap.scaling = scaling
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
                  weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),
-                 interlineFilter: mode.isInterlacedOrPsF && interlineFilter,
+                 interlineFilter: mode.isInterlacedOrPsF && interlineFilter
+                                  && fieldMode != .sourceInterlaced,
                  filmCadence: weave && filmCadence,
                  sourceFrameRate: routedSourceFrameRate())
   }
