@@ -163,7 +163,11 @@ final class DeckLinkVideoTap {
   /// Bounds for the adaptive depth, and how long a clean run has to be before it gives one back.
   private var filmQueueFloor = 2
   private static let filmQueueCeiling = 6
-  private static let cleanRunToShrink = 450   // roughly fifteen seconds of output frames
+  private static let cleanRunToShrink = 1800   // roughly a minute of output frames
+  /// Lowest occupancy seen during the current clean run. Shrinking without knowing this was
+  /// guesswork: giving a frame back when the queue had been touching empty simply bought the next
+  /// hold, which is a plausible reading of holds arriving steadily about once a minute.
+  private var minOccupancySinceHold = Int.max
   private var framesSinceHold = 0
 
   /// Source frames consumed, and whether the count has been left odd by a hold.
@@ -289,6 +293,7 @@ final class DeckLinkVideoTap {
       // often is its own disruption, on top of the starvation causing it.
       let isolated = framesSinceHold > 60
       framesSinceHold = 0
+      minOccupancySinceHold = Int.max
       guard isolated else { return }
       // A hold means the cycle has lost its relationship with the source: it wanted the next frame
       // and there was not one. Carrying on leaves the phase wherever the stall happened to put it,
@@ -303,9 +308,15 @@ final class DeckLinkVideoTap {
     // A clean run means the cushion is larger than it needs to be, and every frame of it is latency
     // nobody asked for. Give one back, slowly, so it settles at the least that works.
     framesSinceHold += 1
-    if framesSinceHold >= Self.cleanRunToShrink, filmQueueDepth > filmQueueFloor {
+    minOccupancySinceHold = min(minOccupancySinceHold, filmReady.count)
+    // Only give a frame back with evidence that it was spare: the queue has to have kept something
+    // in hand for the whole run. A run that merely avoided holding says nothing, since it may have
+    // been reaching empty every time and getting away with it.
+    if framesSinceHold >= Self.cleanRunToShrink, filmQueueDepth > filmQueueFloor,
+       minOccupancySinceHold > 1 {
       filmQueueDepth -= 1
       framesSinceHold = 0
+      minOccupancySinceHold = Int.max
     }
     filmSpare.append(previous)
     previous = current
@@ -661,6 +672,7 @@ final class DeckLinkVideoTap {
     filmQueueDepth = max(1, queueDepth)
     filmQueueFloor = filmQueueDepth
     framesSinceHold = 0
+    minOccupancySinceHold = Int.max
     self.sourceFrameRate = sourceFrameRate
     fieldRate = weaveFields ? fps * 2.0 : fps
     frameRate = fps
