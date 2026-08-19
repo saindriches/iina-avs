@@ -169,6 +169,10 @@ class DeckLinkController {
   /// Times the cadence wanted a film frame and had none. Should stay at zero.
   var cadenceHolds: Int { tap.cadenceHolds }
 
+  /// Output frames built from two different source moments. Must be zero at or below half the
+  /// field rate; anything else means the cadence phase has slipped.
+  var mixedFrames: Int { tap.mixedFrames }
+
   /// Frames the card was handed twice, which nothing counted before.
   var duplicateFrames: Int { tap.duplicatesOut }
 

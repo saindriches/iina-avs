@@ -569,7 +569,9 @@ class DeckLinkPanelController: NSWindowController {
                        rates.effective, fieldRate, dl.cadenceHolds)
       }
       if !dl.fieldOrderHasEffect {
-        build += ", one moment per frame"
+        // If this says one moment per frame, `mixed` must stay at zero. A rising count there is
+        // the phase having slipped, which is the thing that reads as a flipped field order.
+        build += String(format: ", one moment per frame, mixed %ld", dl.mixedFrames)
       }
     } else if dl.weaveStarved {
       // Only as many distinct moments a second as the source has frames, so field-rate motion

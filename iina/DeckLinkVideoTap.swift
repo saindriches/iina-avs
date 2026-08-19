@@ -284,10 +284,24 @@ final class DeckLinkVideoTap {
     return true
   }
 
+  /// Frames whose two fields came from DIFFERENT source frames.
+  ///
+  /// At or below half the field rate this must be zero: one source frame per output frame means
+  /// both fields are the same moment. Anything else means the phase has slipped and frames are
+  /// being built from two different moments, which for already-interlaced content mixes two combed
+  /// frames and reads exactly like an inverted field order.
+  private(set) var mixedFrames = 0
+
   /// Move on to the next source frame, or record that there was not one to move to.
   private func pullCadenceFrame() {
     guard !filmReady.isEmpty else {
       cadenceHolds += 1
+      // Give the phase back. The wrap that brought us here said "move to the next source frame",
+      // and we could not, so keeping the advance would leave the slot counter one frame ahead of
+      // what has actually been consumed, permanently. Every pairing after that is offset by one,
+      // which is why a hold changed the field order for good rather than costing a single frame.
+      // Putting it back means the next slot asks again, and phase and consumption stay locked.
+      cadenceAcc += 1.0
       // Grow. A hold means the cushion was too thin for how unevenly this source arrives: 50p on a
       // 60 Hz panel is held for one refresh then two, so its frames land with a field of jitter
       // either way, and two frames of queue cannot cover that. Sizing by measurement beats sizing
@@ -743,6 +757,7 @@ final class DeckLinkVideoTap {
     frameComplete = !weaveFields
     capturedFrames = 0
     publishedFrames = 0
+    mixedFrames = 0
     duplicatesOut = 0
     publishSerial = 0
     lastHandedSerial = -1
@@ -1329,8 +1344,10 @@ final class DeckLinkVideoTap {
     }
 
     let firstSource = current
+    let consumedBefore = sourceConsumed
     if stepCadenceSlot() { pullCadenceFrame() }
     let secondSource = current
+    if sourceConsumed != consumedBefore { mixedFrames += 1 }
 
     let rowBytes = width * 4
     // The earlier moment has to land in the field the card transmits first.
