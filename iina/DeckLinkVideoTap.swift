@@ -165,6 +165,24 @@ final class DeckLinkVideoTap {
   private static let filmQueueCeiling = 6
   private static let cleanRunToShrink = 450   // roughly fifteen seconds of output frames
   private var framesSinceHold = 0
+
+  /// Source frames consumed, and whether the count has been left odd by a hold.
+  ///
+  /// When the source arrives at the field rate, an output frame consumes exactly TWO moments: the
+  /// earlier one to the rows the card sends first, the later one to the rows it sends second. A
+  /// hold consumes one, so every pairing after it is offset by one and each moment lands on the
+  /// OPPOSITE spatial field to the one it belongs on. For material whose successive frames are
+  /// alternating original fields that is an inverted field order, and it persists until the next
+  /// hold flips it back, which is exactly the once-a-minute rhythm this shows.
+  ///
+  /// Resetting the phase does not repair it: the phase says when to pull, not how many have been
+  /// pulled. Parity has to be restored explicitly, by consuming one extra frame at the next chance.
+  /// That costs a single dropped moment against an inversion that would otherwise last a minute.
+  private var sourceConsumed = 0
+  private var pairingNeedsCatchUp = false
+  /// Only meaningful when two source frames make one output frame. Other ratios have no fixed
+  /// pairing parity to preserve, so forcing one would drop frames for nothing.
+  private var pairingParityMatters: Bool { abs(cadenceRatioLocked - 1.0) < 0.02 }
   private var current = [UInt8]()
   private var previous = [UInt8]()
   /// Whether the one line shift is actually being applied, as opposed to merely asked for. The two
@@ -264,6 +282,7 @@ final class DeckLinkVideoTap {
       // either way, and two frames of queue cannot cover that. Sizing by measurement beats sizing
       // by guess, since the right depth depends on the source and the panel, not on us.
       filmQueueDepth = min(Self.filmQueueCeiling, filmQueueDepth + 1)
+      if pairingParityMatters, sourceConsumed % 2 != 0 { pairingNeedsCatchUp = true }
       // Re-anchoring the phase is right for an ISOLATED hold, where the cycle has genuinely lost
       // the source and would otherwise stay offset until someone toggled a setting. It is wrong
       // when holds are chronic, which was the case here at more than one a second: resetting that
@@ -291,6 +310,7 @@ final class DeckLinkVideoTap {
     filmSpare.append(previous)
     previous = current
     current = filmReady.removeFirst()
+    sourceConsumed &+= 1
   }
 
   var cadenceEngaged: Bool {
@@ -646,6 +666,8 @@ final class DeckLinkVideoTap {
     frameRate = fps
     fieldParity = 0
     cadenceAcc = 0
+    sourceConsumed = 0
+    pairingNeedsCatchUp = false
     // Keep the last picture across a re-arm when the raster has not changed. Re-allocating zeroed
     // buffers meant every settings change put black on the monitor until the next capture arrived,
     // and the feeder's own black fill covered the gap before that. The geometry check is what makes
@@ -1253,6 +1275,13 @@ final class DeckLinkVideoTap {
                                    width: Int, height: Int, stride: Int) {
     // The first field is whatever the current slot sits on. Held as a local because the step below
     // may move `current` on, and this frame still needs the moment it had.
+    // Put the pairing back on an even count before building anything, so the two moments land on
+    // the fields they belong to. One frame goes by to buy it.
+    if pairingNeedsCatchUp, !filmReady.isEmpty {
+      pullCadenceFrame()
+      pairingNeedsCatchUp = false
+    }
+
     let firstSource = current
     if stepCadenceSlot() { pullCadenceFrame() }
     let secondSource = current
