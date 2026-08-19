@@ -186,6 +186,23 @@ class DeckLinkController {
   private(set) var sourceHeight = 0
   private(set) var sourceDeinterlacing = false
 
+  /// The 525-line raster, and the only one this applies to.
+  ///
+  /// Deliberately narrow. 480 in 486 is a real and universal mismatch, since DeckLink offers the
+  /// full BT.601 active picture and files carry the DV/MPEG height. Nothing else has that problem:
+  /// PAL files are 576 in a 576 raster, and HD matches exactly. So the placement path is gated on
+  /// the NTSC height rather than on "source is shorter", which would quietly catch a cropped HD
+  /// file and blank six lines of it for no reason.
+  private static let ntscRasterHeight = 486
+
+  var usesLinePlacement: Bool {
+    guard let mode = selectedMode, fieldMode == .sourceInterlaced else { return false }
+    return mode.height == Self.ntscRasterHeight && sourceHeight > 0 && sourceHeight < mode.height
+  }
+
+  /// Where the source lands in the raster, for the panel to state rather than imply.
+  var linePlacement: (height: Int, top: Int) { tap.linePlacement }
+
   /// True when the source can actually survive being passed through as fields.
   var sourceInterlaceClean: Bool {
     guard let mode = selectedMode else { return false }
@@ -618,6 +635,28 @@ class DeckLinkController {
 
   /// Read what would quietly break a field passthrough. Main thread, once a second, same as the
   /// rate: these only change when the file or a filter does.
+  /// mpv fits by aspect by default, so a 4:3 file in a 720-wide region would be pillarboxed to 640
+  /// and scaled horizontally. SD has a non-square pixel aspect by definition and the full 720 must
+  /// be used, so aspect keeping is turned off for the duration and put back afterwards. Scoped to
+  /// the placement case alone; nothing else touches it.
+  private var savedKeepAspect: Bool?
+
+  private func updateLinePlacement() {
+    guard let mode = selectedMode else { return }
+    let wanted = usesLinePlacement
+    tap.setLinePlacement(sourceHeight: wanted ? sourceHeight : 0, rasterHeight: mode.height)
+    guard let player = routedPlayer, player.info.state.loaded, let mpv = player.mpv else { return }
+    if wanted {
+      if savedKeepAspect == nil {
+        savedKeepAspect = mpv.getFlag(MPVOption.Window.keepaspect)
+        mpv.setFlag(MPVOption.Window.keepaspect, false)
+      }
+    } else if let saved = savedKeepAspect {
+      mpv.setFlag(MPVOption.Window.keepaspect, saved)
+      savedKeepAspect = nil
+    }
+  }
+
   private func refreshSourceGeometry() {
     guard let player = routedPlayer, player.info.state.loaded, let mpv = player.mpv else {
       sourceHeight = 0
@@ -635,6 +674,7 @@ class DeckLinkController {
       guard let self = self else { return }
       self.tap.updateSourceFrameRate(self.routedSourceFrameRate())
       self.refreshSourceGeometry()
+      self.updateLinePlacement()
       let now = self.estimatedLatency
       self.smoothedLatency = self.smoothedLatency > 0 ? self.smoothedLatency * 0.7 + now * 0.3 : now
       self.updateAudioCompensation()
@@ -646,6 +686,12 @@ class DeckLinkController {
   private func stopSourceRateTimer() {
     sourceRateTimer?.invalidate()
     sourceRateTimer = nil
+    tap.setLinePlacement(sourceHeight: 0, rasterHeight: 0)
+    if let saved = savedKeepAspect, let player = routedPlayer, player.info.state.loaded,
+       let mpv = player.mpv {
+      mpv.setFlag(MPVOption.Window.keepaspect, saved)
+      savedKeepAspect = nil
+    }
     updateAudioCompensation()   // output is going away, so give the audio delay back
   }
 

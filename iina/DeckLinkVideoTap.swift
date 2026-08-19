@@ -56,6 +56,44 @@ final class DeckLinkVideoTap {
   /// rows destroys them. So no weaving, no cadence, no filter, and no vertical resampling upstream
   /// either, which is the one precondition the tap cannot enforce for itself.
   var sourceInterlaced = false
+  /// SD line placement, for 525-line only. Zero when it does not apply.
+  ///
+  /// DeckLink's NTSC raster is 720x486, the full BT.601 active picture, while almost every file is
+  /// 720x480 because DV and MPEG-2 drop six lines. Fitting one to the other by SCALING resamples
+  /// vertically and averages each line with the other field, which for a pass-through destroys the
+  /// thing being passed through. Broadcast practice is to place the 480 lines in the 486 raster
+  /// untouched and blank the rest, four lines at the top and two at the bottom.
+  ///
+  /// The offset has to be EVEN or every source line changes field, which inverts the field order
+  /// silently. That is why centring is wrong here: six halves to three.
+  private var placedHeight = 0
+  private var placedTopOffset = 0
+
+  /// Height mpv should render at, so it is never asked to scale into the taller raster.
+  var renderHeightOverride: Int { placedHeight }
+
+  func setLinePlacement(sourceHeight: Int, rasterHeight: Int) {
+    lock.lock()
+    defer { lock.unlock() }
+    guard sourceInterlaced, sourceHeight > 0, sourceHeight < rasterHeight else {
+      placedHeight = 0
+      placedTopOffset = 0
+      return
+    }
+    placedHeight = sourceHeight
+    let difference = rasterHeight - sourceHeight
+    // Round the half up to the next even line: 6 becomes 4, which is the broadcast convention for
+    // 480 in 486, and evenness is what keeps each line on the field it started on.
+    placedTopOffset = ((difference / 2) + 1) & ~1
+  }
+
+  /// What the panel should say about it.
+  var linePlacement: (height: Int, top: Int) {
+    lock.lock()
+    defer { lock.unlock() }
+    return (placedHeight, placedTopOffset)
+  }
+
   /// Shift the picture one line, exchanging which rows land in which field. The only lever there is
   /// when the source was encoded with the opposite dominance to the raster, since the fields are
   /// already committed to their lines and nothing else can reorder them.
@@ -728,7 +766,18 @@ final class DeckLinkVideoTap {
     if sourceInterlaced {
       working.withUnsafeMutableBytes { raw in
         guard let dstBase = raw.baseAddress else { return }
-        if swapSourceFields {
+        if placedHeight > 0 {
+          // mpv rendered into the top `placedHeight` rows of the target, so move them down to the
+          // placement line and blank the rest. Field Order still adds its one line on top, which is
+          // the escape hatch if the chain wants the opposite parity.
+          memset(dstBase, 0, rowBytes * h)
+          let shift = placedTopOffset + (swapSourceFields ? 1 : 0)
+          for y in 0..<placedHeight {
+            let target = y + shift
+            guard target >= 0, target < h else { continue }
+            memcpy(dstBase.advanced(by: target * rowBytes), src.advanced(by: y * rowBytes), rowBytes)
+          }
+        } else if swapSourceFields {
           // One line down: row 0 takes source row 1, so what was the upper field becomes the lower.
           // The last row has nothing above it to take and keeps what it had, which is one line of
           // the wrong field at the very bottom of the raster, past anything a tube shows.
@@ -897,6 +946,10 @@ final class DeckLinkVideoTap {
 
     glBindFramebuffer(GLenum(GL_FRAMEBUFFER), fbo)
     glViewport(0, 0, GLsizei(w), GLsizei(h))
+    if placedHeight > 0 {
+      glClearColor(0, 0, 0, 1)   // the rows outside the placement must be blanking, not last frame
+      glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
+    }
 
     // Unflipped, so the bottom-up glReadPixels below lands top-down for the card. The screen blit
     // afterwards flips it back for display.
@@ -904,7 +957,10 @@ final class DeckLinkVideoTap {
     // 10, matching the RGB10_A2 target: this is what mpv dithers to, so leaving it at 8 threw the
     // extra bits away before they were ever written.
     var depth: CInt = 10
-    var data = mpv_opengl_fbo(fbo: Int32(fbo), w: Int32(w), h: Int32(h), internal_format: 0)
+    // Render into only the rows the source actually has, when placing rather than scaling. mpv
+    // fills the region it is given, so asking for the source height is what keeps it 1:1.
+    let renderHeight = placedHeight > 0 ? placedHeight : h
+    var data = mpv_opengl_fbo(fbo: Int32(fbo), w: Int32(w), h: Int32(renderHeight), internal_format: 0)
     withUnsafeMutablePointer(to: &data) { dataPtr in
       withUnsafeMutablePointer(to: &flip) { flipPtr in
         withUnsafeMutablePointer(to: &depth) { depthPtr in

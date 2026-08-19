@@ -578,9 +578,16 @@ class DeckLinkPanelController: NSWindowController {
         note = "source fields NEED Render at Output Resolution"
       } else if dl.sourceDeinterlacing {
         note = "source fields, but mpv is DEINTERLACING"
-      } else if dl.sourceHeight > 0 && dl.sourceHeight != mode.height {
+      } else if dl.sourceHeight > 0 && dl.sourceHeight != mode.height && !dl.usesLinePlacement {
         note = String(format: "source fields, but %ld is being scaled to %ld",
                       dl.sourceHeight, mode.height)
+      } else if dl.usesLinePlacement {
+        // State the offset rather than implying it: an odd one silently inverts the field order,
+        // so it is exactly the number worth being able to read back.
+        let placement = dl.linePlacement
+        note = String(format: "source fields, %ld placed in %ld at line %ld%@",
+                      placement.height, mode.height, placement.top,
+                      dl.fieldOrder == .lowerFirst ? ", swapped" : "")
       } else if dl.fieldOrder == .lowerFirst {
         note = "source fields, swapped"
       }
