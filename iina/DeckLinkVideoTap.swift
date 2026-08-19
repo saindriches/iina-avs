@@ -296,12 +296,12 @@ final class DeckLinkVideoTap {
   private func pullCadenceFrame() {
     guard !filmReady.isEmpty else {
       cadenceHolds += 1
-      // Give the phase back. The wrap that brought us here said "move to the next source frame",
-      // and we could not, so keeping the advance would leave the slot counter one frame ahead of
-      // what has actually been consumed, permanently. Every pairing after that is offset by one,
-      // which is why a hold changed the field order for good rather than costing a single frame.
-      // Putting it back means the next slot asks again, and phase and consumption stay locked.
-      cadenceAcc += 1.0
+      // Do NOT refund the phase here. Adding a whole frame of it makes the very next slot re-wrap,
+      // which moves the pull from the trailing step to the leading one: the frame then pairs two
+      // different source moments, consumes two frames instead of one, drains the queue and causes
+      // the next hold. Measured, that ran to 1794 holds and 2137 mixed frames out of 4151 sent.
+      // The accumulator counts SLOTS, not frames, so 1.0 was the wrong unit to give back. Leaving
+      // the phase alone costs a repeated frame and nothing else.
       // Grow. A hold means the cushion was too thin for how unevenly this source arrives: 50p on a
       // 60 Hz panel is held for one refresh then two, so its frames land with a field of jitter
       // either way, and two frames of queue cannot cover that. Sizing by measurement beats sizing
