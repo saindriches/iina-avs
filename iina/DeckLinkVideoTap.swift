@@ -310,6 +310,9 @@ final class DeckLinkVideoTap {
     lock.lock()
     if abs(fps - sourceFrameRate) > 0.001 {
       sourceFrameRate = fps
+      // This is what decides whether weaving runs at all, so a change to it can switch the mode
+      // mid-pair. Start the next pair cleanly rather than half way through the previous one.
+      fieldParity = 0
       updateSampleIntervalLocked()
       nextSampleAt = 0        // the sample rate changed with it, so restart the phase
     }
@@ -841,6 +844,12 @@ final class DeckLinkVideoTap {
       }
 
       guard weaving else {
+        // Weaving can suspend and resume while running, because the starved test depends on a
+        // source rate that is polled and can change under a seek or a file change. Leaving the
+        // parity wherever it stopped meant weaving could resume mid-pair, which assembles every
+        // later pair the wrong way round and inverts the field order until something happens to
+        // flip it back. Resuming from a known phase is the whole fix.
+        fieldParity = 0
         if interlineFilter {
           for y in 0..<h { copyRow(y) }
         } else {
