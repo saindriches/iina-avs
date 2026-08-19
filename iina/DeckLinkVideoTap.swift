@@ -34,6 +34,9 @@ final class DeckLinkVideoTap {
   private var sampleInterval: CFTimeInterval = 0
   /// When the next sample is ideally due. See `shouldSample`.
   private var nextSampleAt: CFTimeInterval = 0
+  /// Smoothed interval between draw hooks, so the gate can tell a fast draw loop from a scarce one.
+  private var hookIntervalEMA: CFTimeInterval = 0
+  private var lastHookAt: CFTimeInterval = 0
 
   /// True interlace: the two fields of a frame must be DIFFERENT moments, 1/fieldRate apart, which
   /// is what a CRT's scan actually shows. PsF is the other case and needs none of this, because both
@@ -532,6 +535,8 @@ final class DeckLinkVideoTap {
     publishedFrames = 0
     hookCalls = 0
     nextSampleAt = 0
+    hookIntervalEMA = 0
+    lastHookAt = 0
     updateSampleIntervalLocked()
     lock.unlock()
   }
@@ -578,6 +583,22 @@ final class DeckLinkVideoTap {
   /// Caller is on the GL thread.
   private func shouldSample(at now: CFTimeInterval) -> Bool {
     guard sampleInterval > 0 else { return true }
+
+    if lastHookAt > 0 {
+      let dt = now - lastHookAt
+      if dt > 0, dt < 1.0 { hookIntervalEMA = hookIntervalEMA > 0 ? hookIntervalEMA * 0.9 + dt * 0.1 : dt }
+    }
+    lastHookAt = now
+
+    // When draws arrive no faster than samples are wanted, every draw is a new picture and gating
+    // can only throw one away. Telecined material is the case that needs this: mpv presents those
+    // frames for two field times and then three, so the draws are UNEVEN even though their average
+    // is right, and a gate built on an even cadence samples twice inside a long frame and misses a
+    // short one. That is what makes the output rate wander on exactly this content.
+    if hookIntervalEMA > 0, hookIntervalEMA >= sampleInterval * 0.95 {
+      nextSampleAt = now + sampleInterval   // keep the phase sane if draws speed up again
+      return true
+    }
     guard nextSampleAt > 0 else {          // first sample of the session sets the phase
       nextSampleAt = now + sampleInterval
       return true
