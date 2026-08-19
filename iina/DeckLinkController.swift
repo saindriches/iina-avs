@@ -175,6 +175,17 @@ class DeckLinkController {
   /// Whether the one line shift is really being applied.
   var isSwappingFields: Bool { tap.isSwappingFields }
 
+  /// False when the two fields of an output frame necessarily hold the same moment, which makes
+  /// field order inert. See the tap.
+  var fieldOrderHasEffect: Bool {
+    guard let mode = selectedMode, mode.isInterlaced else { return false }
+    switch fieldMode {
+    case .sourceInterlaced: return true            // the one line shift always does something
+    case .psf: return false                        // one instant in both fields by definition
+    case .trueInterlace: return tap.cadencePairsDistinctMoments || !filmCadence
+    }
+  }
+
   /// Frame rate of the file being shown, as the tap last saw it.
   var sourceFrameRate: Double { tap.sourceRate }
 
@@ -558,6 +569,7 @@ class DeckLinkController {
     fieldOrder = order
     UserDefaults.standard.set(order.rawValue, forKey: Keys.fieldOrder)
     reconfigureTapIfRunning()
+    tap.requestParityRealign()   // take effect now, not whenever the next hold happens to arrive
   }
 
   /// Which field carries the earlier moment, after any override.

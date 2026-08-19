@@ -386,6 +386,31 @@ final class DeckLinkVideoTap {
     return weaveStarvedLocked
   }
 
+  /// Apply a pairing change NOW rather than at the next hold.
+  ///
+  /// The parity target was only consulted when a hold happened, so flipping the field order did
+  /// nothing until one did, and whether it then helped was down to which parity the count happened
+  /// to be on. A control whose effect arrives minutes later, at random, is worse than no control.
+  func requestParityRealign() {
+    lock.lock()
+    if pairingParityMatters, sourceConsumed % 2 != pairingParityTarget {
+      pairingNeedsCatchUp = true
+    }
+    lock.unlock()
+  }
+
+  /// Whether the two fields of an output frame can hold DIFFERENT moments.
+  ///
+  /// They cannot when the source supplies at most one frame per output frame, which is any ratio at
+  /// or below a half: both fields come from the same frame and the output is a whole-frame copy. In
+  /// that case field order has nothing to reorder, so the control is inert and should say so rather
+  /// than appear to work.
+  var cadencePairsDistinctMoments: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return cadenceEngagedLocked && cadenceRatioLocked > 0.5 + 0.001
+  }
+
   /// mpv's reported frame rate for the current file, which can change when the file does.
   func updateSourceFrameRate(_ fps: Double) {
     lock.lock()

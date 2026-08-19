@@ -428,8 +428,11 @@ class DeckLinkPanelController: NSWindowController {
     if let index = fieldOrders.firstIndex(where: { $0.0 == dl.fieldOrder }) {
       fieldOrderPopUp.selectItem(at: index)
     }
-    fieldOrderPopUp.isEnabled = interlacedRaster
-      && (dl.fieldMode == .trueInterlace || dl.fieldMode == .sourceInterlaced)
+    // A control that cannot change the output must not look as though it can. In True Interlace on
+    // a source at or below half the field rate, both fields of a frame come from the SAME source
+    // frame, so there is nothing for an order to reorder; pass-through is the mode that still has a
+    // lever there, because its fields are already in the rows.
+    fieldOrderPopUp.isEnabled = dl.fieldOrderHasEffect
     fieldOrderPopUp.toolTip = dl.fieldMode == .sourceInterlaced
       ? NSLocalizedString("menu.decklink_field_order_src_tip",
                           value: "Which field the SOURCE was encoded with first. The card splits the frame by row parity, so when the source disagrees with the raster the picture is shifted one line, which exchanges the two fields without visibly moving anything. Auto assumes the source agrees with the raster.",
@@ -551,7 +554,7 @@ class DeckLinkPanelController: NSWindowController {
     // -- build, and the capture rate the chosen scheme implies.
     let fieldRate = mode.fps * 2.0
     var needed = weaving ? fieldRate : mode.fps
-    let build: String
+    var build: String
     if dl.cadenceEngaged {
       // One capture per SOURCE frame: the cadence builds the fields itself.
       needed = dl.sourceFrameRate
@@ -564,6 +567,9 @@ class DeckLinkPanelController: NSWindowController {
       } else {
         build = String(format: "cadence %.2f fps into %.2f fields, %ld holds",
                        rates.effective, fieldRate, dl.cadenceHolds)
+      }
+      if !dl.fieldOrderHasEffect {
+        build += ", one moment per frame"
       }
     } else if dl.weaveStarved {
       // Only as many distinct moments a second as the source has frames, so field-rate motion
