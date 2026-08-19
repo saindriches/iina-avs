@@ -162,7 +162,9 @@ final class DeckLinkVideoTap {
   private var filmQueueDepth = 4
   /// Bounds for the adaptive depth, and how long a clean run has to be before it gives one back.
   private var filmQueueFloor = 2
-  private static let filmQueueCeiling = 6
+  private static let filmQueueCeiling = 4
+  /// Slow average of queue occupancy, for telling a sudden dip from a steady drain.
+  private var occupancyEMA: Double = 0
   private static let cleanRunToShrink = 1800   // roughly a minute of output frames
   /// Lowest occupancy seen during the current clean run. Shrinking without knowing this was
   /// guesswork: giving a frame back when the queue had been touching empty simply bought the next
@@ -395,7 +397,16 @@ final class DeckLinkVideoTap {
       // 60 Hz panel is held for one refresh then two, so its frames land with a field of jitter
       // either way, and two frames of queue cannot cover that. Sizing by measurement beats sizing
       // by guess, since the right depth depends on the source and the panel, not on us.
-      filmQueueDepth = min(Self.filmQueueCeiling, filmQueueDepth + 1)
+      // Grow only for a DIP, never for a DRAIN. Buffer is the cure for jitter and the wrong
+      // medicine for a rate deficit: mpv follows the Mac's audio clock and the card follows its own
+      // crystal, and a trace measured the queue sliding from 6 to 1 over 137 seconds, a deficit of
+      // about a tenth of a percent. Against that, more buffer only postpones the same hold while
+      // making the latency permanently worse, which is how this reached two hundred milliseconds.
+      // A hold caused by a deficit is one repeated frame every half minute or so and is the honest
+      // price; a hold caused by jitter is worth a frame of cushion.
+      if occupancyEMA >= 1.5 {
+        filmQueueDepth = min(Self.filmQueueCeiling, filmQueueDepth + 1)
+      }
       if pairingParityMatters, sourceConsumed % 2 != pairingParityTarget {
         pairingNeedsCatchUp = true
       }
@@ -421,11 +432,17 @@ final class DeckLinkVideoTap {
     // nobody asked for. Give one back, slowly, so it settles at the least that works.
     framesSinceHold += 1
     minOccupancySinceHold = min(minOccupancySinceHold, filmReady.count)
+    occupancyEMA = occupancyEMA * 0.995 + Double(filmReady.count) * 0.005
     // Only give a frame back with evidence that it was spare: the queue has to have kept something
     // in hand for the whole run. A run that merely avoided holding says nothing, since it may have
     // been reaching empty every time and getting away with it.
+    // Never ran DRY is the evidence that matters, not "kept two in hand". Requiring more than one
+    // never came true in practice, because a healthy queue touches one routinely: measured over
+    // four thousand frames, depth one occurred 780 times and zero only four. So the depth grew on
+    // every hold, reached the ceiling, and stayed there, which is around two hundred milliseconds
+    // of latency that nothing could give back.
     if framesSinceHold >= Self.cleanRunToShrink, filmQueueDepth > filmQueueFloor,
-       minOccupancySinceHold > 1 {
+       minOccupancySinceHold >= 1 {
       filmQueueDepth -= 1
       framesSinceHold = 0
       minOccupancySinceHold = Int.max
@@ -809,6 +826,7 @@ final class DeckLinkVideoTap {
     self.filmCadence = filmCadence
     filmQueueDepth = max(1, queueDepth)
     filmQueueFloor = filmQueueDepth
+    occupancyEMA = Double(filmQueueDepth)
     framesSinceHold = 0
     minOccupancySinceHold = Int.max
     self.sourceFrameRate = sourceFrameRate
