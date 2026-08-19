@@ -160,6 +160,11 @@ final class DeckLinkVideoTap {
   /// frame, so four there is three frames of delay for nothing: measured at 164 ms against 33 ms for
   /// the modes that do not queue. Sized to the consumer instead of to the worst consumer.
   private var filmQueueDepth = 4
+  /// Bounds for the adaptive depth, and how long a clean run has to be before it gives one back.
+  private var filmQueueFloor = 2
+  private static let filmQueueCeiling = 6
+  private static let cleanRunToShrink = 450   // roughly fifteen seconds of output frames
+  private var framesSinceHold = 0
   private var current = [UInt8]()
   private var previous = [UInt8]()
   /// Whether the one line shift is actually being applied, as opposed to merely asked for. The two
@@ -254,6 +259,18 @@ final class DeckLinkVideoTap {
   private func pullCadenceFrame() {
     guard !filmReady.isEmpty else {
       cadenceHolds += 1
+      // Grow. A hold means the cushion was too thin for how unevenly this source arrives: 50p on a
+      // 60 Hz panel is held for one refresh then two, so its frames land with a field of jitter
+      // either way, and two frames of queue cannot cover that. Sizing by measurement beats sizing
+      // by guess, since the right depth depends on the source and the panel, not on us.
+      filmQueueDepth = min(Self.filmQueueCeiling, filmQueueDepth + 1)
+      // Re-anchoring the phase is right for an ISOLATED hold, where the cycle has genuinely lost
+      // the source and would otherwise stay offset until someone toggled a setting. It is wrong
+      // when holds are chronic, which was the case here at more than one a second: resetting that
+      // often is its own disruption, on top of the starvation causing it.
+      let isolated = framesSinceHold > 60
+      framesSinceHold = 0
+      guard isolated else { return }
       // A hold means the cycle has lost its relationship with the source: it wanted the next frame
       // and there was not one. Carrying on leaves the phase wherever the stall happened to put it,
       // and since nothing pulls it back, a single hold can leave the pairing offset for good. That
@@ -263,6 +280,13 @@ final class DeckLinkVideoTap {
       cadenceAcc = 0
       fieldParity = 0
       return
+    }
+    // A clean run means the cushion is larger than it needs to be, and every frame of it is latency
+    // nobody asked for. Give one back, slowly, so it settles at the least that works.
+    framesSinceHold += 1
+    if framesSinceHold >= Self.cleanRunToShrink, filmQueueDepth > filmQueueFloor {
+      filmQueueDepth -= 1
+      framesSinceHold = 0
     }
     filmSpare.append(previous)
     previous = current
@@ -615,6 +639,8 @@ final class DeckLinkVideoTap {
     self.interlineFilter = interlineFilter
     self.filmCadence = filmCadence
     filmQueueDepth = max(1, queueDepth)
+    filmQueueFloor = filmQueueDepth
+    framesSinceHold = 0
     self.sourceFrameRate = sourceFrameRate
     fieldRate = weaveFields ? fps * 2.0 : fps
     frameRate = fps
