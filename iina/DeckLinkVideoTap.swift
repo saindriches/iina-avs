@@ -500,6 +500,14 @@ final class DeckLinkVideoTap {
     return sourceFrameRate
   }
 
+  /// Smoothed queue occupancy, which is the integral of the production error and therefore the
+  /// only signal that already knows about every clock in the chain at once.
+  var queueOccupancy: Double {
+    lock.lock()
+    defer { lock.unlock() }
+    return occupancyEMA
+  }
+
   var weaveStarved: Bool {
     lock.lock()
     defer { lock.unlock() }

@@ -61,6 +61,7 @@ class DeckLinkPanelController: NSWindowController {
   private var nativeRenderBox: NSButton!
   private var lowLatencyBox: NSButton!
   private var compensateAudioBox: NSButton!
+  private var matchClockBox: NSButton!
   private var releaseBox: NSButton!
   private var toggleButton: NSButton!
   private var statusLabel: NSTextField!
@@ -162,6 +163,13 @@ class DeckLinkPanelController: NSWindowController {
     lowLatencyBox = addCheck(to: stack, NSLocalizedString("menu.decklink_low_latency",
                                                           value: "Low Latency Mode", comment: ""),
                              action: #selector(toggleLowLatency(_:)))
+    matchClockBox = addCheck(to: stack, NSLocalizedString("menu.decklink_match_clock",
+                                                         value: "Match Card Clock", comment: ""),
+                             action: #selector(toggleMatchClock(_:)))
+    matchClockBox.toolTip = NSLocalizedString("menu.decklink_match_clock_tip",
+                                              value: "Trim playback speed by a fraction of a percent so frames are produced at the card's rate rather than the Mac's. Without it the two clocks drift about a tenth of a percent apart and a frame is repeated every fifty seconds or so. The trim is far below anything audible and audio is resampled, not pitched.",
+                                              comment: "")
+
     compensateAudioBox = addCheck(to: stack, NSLocalizedString("menu.decklink_compensate_audio",
                                                                value: "Delay Audio to Match", comment: ""),
                                   action: #selector(toggleCompensateAudio(_:)))
@@ -488,6 +496,8 @@ class DeckLinkPanelController: NSWindowController {
     testOpacitySlider.doubleValue = dl.testOpacity
     testOpacitySlider.isEnabled = dl.testPattern != .off
 
+    matchClockBox.state = dl.matchCardClock ? .on : .off
+    matchClockBox.isEnabled = true
     compensateAudioBox.state = dl.compensateAudio ? .on : .off
     [nativeRenderBox, lowLatencyBox, releaseBox, testPatternPopUp,
      compensateAudioBox].forEach { $0?.isEnabled = true }
@@ -639,6 +649,9 @@ class DeckLinkPanelController: NSWindowController {
     var delay = String(format: "delay   %.0f ms, %ld in card",
                        dl.smoothedLatency * 1000.0, dl.bufferedFrames)
     if dl.compensateAudio { delay += ", audio matched" }
+    if dl.matchCardClock, dl.clockTrimPPM != 0 {
+      delay += String(format: ", clock %+ld ppm", dl.clockTrimPPM)
+    }
     lines.append(delay)
 
     // -- count. Scheduled is context; the rest should all be zero.
@@ -757,6 +770,11 @@ class DeckLinkPanelController: NSWindowController {
 
   @objc private func toggleLowLatency(_ sender: NSButton) {
     DeckLinkController.shared.lowLatency = (sender.state == .on)
+    refresh()
+  }
+
+  @objc private func toggleMatchClock(_ sender: NSButton) {
+    DeckLinkController.shared.setMatchCardClock(sender.state == .on)
     refresh()
   }
 

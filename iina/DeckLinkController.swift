@@ -33,6 +33,7 @@ private struct Keys {
   static let compensateAudio = "decklink.compensateAudio"
   static let testPattern = "decklink.testPattern"
   static let testOpacity = "decklink.testOpacity"
+  static let matchCardClock = "decklink.matchCardClock"
 }
 
 /// How the two fields of an interlaced frame are produced.
@@ -156,6 +157,26 @@ class DeckLinkController {
 
   /// How a picture of a different shape is mapped onto the SDI raster.
   private(set) var scaling: DeckLinkScaling
+
+  /// Trim playback speed so production matches the card, instead of repeating a frame when it does
+  /// not.
+  ///
+  /// mpv's playback is paced by the Mac's audio device and the card by its own crystal. They differ
+  /// by around a tenth of a percent, measured: queue occupancy slid from six frames to one over 137
+  /// seconds. Nothing downstream can invent the missing frames, so the choice is to repeat one
+  /// every fifty seconds or to make the producer run at the consumer's rate.
+  ///
+  /// Genlock cannot help. The card can be slaved to an external reference, but nothing can slave it
+  /// to the Mac, and there is no house clock here. What playout does in that situation is trim the
+  /// player, and a tenth of a percent is about two cents of pitch, which is inaudible, and is
+  /// resampled rather than pitched anyway while audio-pitch-correction is on.
+  ///
+  /// Queue occupancy is the signal to servo on because it is the integral of the error: it already
+  /// accounts for every clock in the chain without any of them having to be identified.
+  private(set) var matchCardClock: Bool
+  private var speedTrim: Double = 0
+  private var baseSpeed: Double?
+  private var speedWeWrote: Double?
 
   /// True while the cadence is not merely asked for but running, which needs a source that really
   /// is 2/5 of the field rate. Surfaced so the panel can say so instead of leaving it ambiguous.
@@ -476,6 +497,7 @@ class DeckLinkController {
     filmCadence = d.object(forKey: Keys.filmCadence) as? Bool ?? true
     scaling = DeckLinkScaling(rawValue: d.object(forKey: Keys.scaling) as? Int ?? 0) ?? .fit
     compensateAudio = d.bool(forKey: Keys.compensateAudio)
+    matchCardClock = d.bool(forKey: Keys.matchCardClock)
     // Pattern is deliberately not persisted; coming back to a test card instead of a picture would
     // be its own bug report. The opacity is, since it is a preference rather than a state.
     tap.testOpacity = d.object(forKey: Keys.testOpacity) as? Double ?? 1.0
@@ -646,6 +668,56 @@ class DeckLinkController {
     notifyChanged()
   }
 
+  func setMatchCardClock(_ on: Bool) {
+    guard on != matchCardClock else { return }
+    matchCardClock = on
+    UserDefaults.standard.set(on, forKey: Keys.matchCardClock)
+    if !on { restoreSpeed() }
+    notifyChanged()
+  }
+
+  /// Hand back whatever speed was in force before, and forget the trim.
+  private func restoreSpeed() {
+    if let base = baseSpeed, let player = routedPlayer, player.info.state.loaded,
+       let mpv = player.mpv {
+      speedWeWrote = base
+      mpv.setDouble(MPVOption.PlaybackControl.speed, base)
+    }
+    baseSpeed = nil
+    speedTrim = 0
+  }
+
+  /// One step of the servo, from the same one second tick as everything else.
+  ///
+  /// Deliberately slow. The correction being chased is a tenth of a percent, the queue is only a
+  /// few frames deep, and a fast loop here would hunt and make the very judder it exists to remove.
+  /// The clamp is the safety: a third of a percent is more than any real clock difference and still
+  /// far below anything audible.
+  private func updateClockMatch() {
+    guard let player = routedPlayer, player.info.state.loaded, let mpv = player.mpv else { return }
+    guard matchCardClock, output.isRunning, cadenceEngaged else {
+      if baseSpeed != nil { restoreSpeed() }
+      return
+    }
+    let current = mpv.getDouble(MPVOption.PlaybackControl.speed)
+    if baseSpeed == nil { baseSpeed = current > 0 ? current : 1.0 }
+    // If the speed moved and it was not us, the user changed it: take that as the new base rather
+    // than fighting them.
+    if let wrote = speedWeWrote, abs(current - wrote) > 0.0005 { baseSpeed = current; speedTrim = 0 }
+
+    let target = 2.0
+    let error = tap.queueOccupancy - target      // negative means draining, so play faster
+    speedTrim = max(-0.003, min(0.003, speedTrim - error * 0.0002))
+    let wanted = (baseSpeed ?? 1.0) * (1.0 + speedTrim)
+    if abs(current - wanted) > 0.00005 {
+      speedWeWrote = wanted
+      mpv.setDouble(MPVOption.PlaybackControl.speed, wanted)
+    }
+  }
+
+  /// How far the speed is being trimmed, in parts per million, for the panel to state.
+  var clockTrimPPM: Int { Int((speedTrim * 1e6).rounded()) }
+
   func setCompensateAudio(_ on: Bool) {
     guard on != compensateAudio else { return }
     compensateAudio = on
@@ -743,6 +815,7 @@ class DeckLinkController {
       self.updateLinePlacement()
       let now = self.estimatedLatency
       self.smoothedLatency = self.smoothedLatency > 0 ? self.smoothedLatency * 0.7 + now * 0.3 : now
+      self.updateClockMatch()
       self.updateAudioCompensation()
     }
     RunLoop.main.add(timer, forMode: .common)
@@ -752,6 +825,7 @@ class DeckLinkController {
   private func stopSourceRateTimer() {
     sourceRateTimer?.invalidate()
     sourceRateTimer = nil
+    restoreSpeed()
     tap.setLinePlacement(sourceHeight: 0, rasterHeight: 0)
     if let saved = savedKeepAspect, let player = routedPlayer, player.info.state.loaded,
        let mpv = player.mpv {
