@@ -1542,6 +1542,25 @@ final class DeckLinkVideoTap {
       pairingNeedsCatchUp = false
     }
 
+    // Anchor the phase to the frame boundary when one source frame makes one output frame.
+    //
+    // At a ratio of a half the accumulator never drifts, so its phase has TWO stable positions: the
+    // wrap on the trailing step, which is correct, and the wrap on the leading step, which pairs two
+    // moments in every frame and never recovers. A trace caught the second one running for an entire
+    // session, phase alternating 0.8104 and 0.3104, mixed and leadstep on 4090 of 4096 frames, with
+    // the ratio itself perfectly correct and consumption at one frame each. The wrap tolerance fixed
+    // slipping INTO that state; nothing could get out of it.
+    //
+    // Where one frame feeds one output frame, the pull belongs at the END of the frame by
+    // definition, so a leading-step wrap is not a phase to preserve but an error to clear. Resetting
+    // costs a single frame once, against an inversion that otherwise lasts as long as playback.
+    //
+    // Ratios above a half are left alone: there a leading-step wrap is legitimate, since those
+    // frames are supposed to carry two moments.
+    if cadenceRatioLocked <= 0.5 + 0.001, cadenceAcc + cadenceRatioLocked >= 1.0 - 1e-6 {
+      cadenceAcc = 0
+    }
+
     let firstSource = current
     let consumedBefore = sourceConsumed
     if stepCadenceSlot() { pullCadenceFrame() }

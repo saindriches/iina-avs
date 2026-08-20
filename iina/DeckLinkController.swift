@@ -181,6 +181,9 @@ class DeckLinkController {
   private var lastProduced: Int?
   private var lastConsumed: Int?
   private var clockWindowTicks = 0
+  /// Queue level when the current window opened. Its change across the window is the fractional
+  /// part of the rate error, which whole holds and drops cannot express.
+  private var lastOccupancyAtWindow: Double?
   /// Whether the first full measurement has been taken, so acquisition can be immediate and
   /// tracking afterwards can be gentle.
   private var hasAcquiredClock = false
@@ -709,6 +712,7 @@ class DeckLinkController {
     speedTrim = 0
     lastProduced = nil
     lastConsumed = nil
+    lastOccupancyAtWindow = nil
     clockWindowTicks = 0
     hasAcquiredClock = false
   }
@@ -760,7 +764,23 @@ class DeckLinkController {
       let dProduced = Double(produced - p0)
       let dShortfall = Double(consumed - c0)      // holds minus drops over the window
       if dProduced > 500 {
-        // HOLDS MINUS DROPS, not produced minus consumed. Those two totals are equal by
+        // Conservation, not just the countable part.
+        //
+        // What flows in must flow out, sit in the queue, or be discarded:
+        //     consumed - produced = holds - drops - change in queue level
+        //
+        // Counting only holds and drops throws away the last term, and that term is the fractional
+        // one. A whole-frame signal cannot do better than one frame of queue movement per window
+        // however long the window: lengthening it improves the ppm resolution and gives the error
+        // proportionally longer to act, so the excursion is always about a frame. Checked, and it is
+        // exactly one frame at sixty seconds and at a hundred and twenty.
+        //
+        // The queue level is a smoothed average, so it carries the part of the drift that has not
+        // yet added up to a whole frame. With it the measurement has sub-frame resolution while
+        // holds and drops still cover the case where the queue is pinned at empty or at the cap and
+        // cannot record anything.
+        //
+        // HOLDS MINUS DROPS, not produced minus consumed, for the countable part. Those two totals are equal by
         // construction, because every frame made is eventually taken and their difference is only
         // the queue level, which is bounded to a handful. Dividing a bounded number by eighteen
         // hundred gave noise with a random sign, which is why one session settled at +1830 ppm and
@@ -772,7 +792,8 @@ class DeckLinkController {
         // Drops count for slightly less than holds, which biases the resting point upward. Both
         // are visible, but a hold repeats a frame in a picture that is meant to be moving at field
         // rate, and the queue running dry is the failure that was actually reported.
-        let rateError = dShortfall / dProduced
+        let dLevel = occupancy - (lastOccupancyAtWindow ?? occupancy)
+        let rateError = (dShortfall - dLevel) / dProduced
         // Take the first measurement whole. Starting from nothing, the damping that keeps later
         // corrections quiet just makes acquisition crawl: several minutes to reach a figure the
         // very first window already knew to within its noise.
@@ -780,16 +801,18 @@ class DeckLinkController {
           speedTrim = max(-0.003, min(0.003, speedTrim + rateError))
           hasAcquiredClock = true
         } else {
-          let step = max(-0.0005, min(0.0005, rateError * 0.5))
+          let step = max(-0.00025, min(0.00025, rateError * 0.5))
           speedTrim = max(-0.003, min(0.003, speedTrim + step))
         }
       }
       lastProduced = produced
       lastConsumed = consumed
+      lastOccupancyAtWindow = occupancy
       clockWindowTicks = 0
     } else if lastProduced == nil {
       lastProduced = produced
       lastConsumed = consumed
+      lastOccupancyAtWindow = occupancy
     }
     // Aim ABOVE two, not below it. The rate is handled by measurement, so the queue exists only to
     // absorb jitter, and the tempting conclusion is to run it as shallow as possible. Observation
