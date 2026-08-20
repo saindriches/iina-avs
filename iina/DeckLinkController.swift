@@ -177,8 +177,6 @@ class DeckLinkController {
   private var speedTrim: Double = 0
   private var baseSpeed: Double?
   private var speedWeWrote: Double?
-  /// Occupancy at the previous tick, so the servo can see which way it is going.
-  private var lastOccupancy: Double?
 
   /// True while the cadence is not merely asked for but running, which needs a source that really
   /// is 2/5 of the field rate. Surfaced so the panel can say so instead of leaving it ambiguous.
@@ -699,7 +697,6 @@ class DeckLinkController {
     }
     baseSpeed = nil
     speedTrim = 0
-    lastOccupancy = nil
   }
 
   /// One step of the servo, from the same one second tick as everything else.
@@ -720,21 +717,21 @@ class DeckLinkController {
     // than fighting them.
     if let wrote = speedWeWrote, abs(current - wrote) > 0.0005 { baseSpeed = current; speedTrim = 0 }
 
-    // Null the DRIFT, not a level. Holding a level was wrong twice over: occupancy is sampled
-    // after the pull so it reads about one less than the depth, and the depth caps it anyway, so a
-    // target of two was unreachable whenever the queue sat at its floor of two. The loop then wound
-    // to its clamp and stayed there, which says nothing about the real clock difference. Reported
-    // as exactly that: pinned at +3000 ppm with no visible effect either way.
+    // PROPORTIONAL, not integral. Occupancy is the integral of the rate error: feed in a trim and
+    // the level ramps. Controlling that with another integrator makes a double integrator, which
+    // has no damping and cannot settle, so it wound to one clamp, overshot, and wound to the other.
+    // Reported as exactly that: +3000 ppm, then -3000, repeating.
     //
-    // What actually needs cancelling is the queue trending, so the trend is the error. A level term
-    // stays, weak, and aimed at something the queue can reach, purely to stop it parking empty or
-    // against the cap where it would hold or drop.
+    // A first-order plant wants a first-order controller. Trim is now a direct function of how far
+    // occupancy sits from where it should, which settles instead of hunting. It settles with a
+    // droop, since holding a steady correction needs a steady offset, and that is fine: at this
+    // gain a tenth of a percent of clock error parks the queue less than a frame below target.
+    //
+    // Saturating now means something. Trim pinned AND the queue empty is a real clock difference
+    // larger than a third of a percent, rather than an artifact of an unreachable target.
     let occupancy = tap.queueOccupancy
-    let drift = occupancy - (lastOccupancy ?? occupancy)
-    lastOccupancy = occupancy
-    let level = max(1.0, Double(tap.queueDepthNow) - 1.0)
-    let error = drift * 4.0 + (occupancy - level) * 0.25
-    speedTrim = max(-0.003, min(0.003, speedTrim - error * 0.0002))
+    let level = 2.0
+    speedTrim = max(-0.003, min(0.003, (level - occupancy) * 0.0015))
     let wanted = (baseSpeed ?? 1.0) * (1.0 + speedTrim)
     if abs(current - wanted) > 0.00005 {
       speedWeWrote = wanted
@@ -975,7 +972,9 @@ class DeckLinkController {
                  sourceFrameRate: routedSourceFrameRate(),
                  // The card-paced path calls the provider once per output frame and never bursts,
                  // so it needs no cushion beyond the one frame being assembled.
-                 queueDepth: lowLatency ? 2 : 4)
+                 // Three when the clock servo is running: it aims the queue at two frames, and a
+                 // depth of two caps occupancy below its own target.
+                 queueDepth: lowLatency ? (matchCardClock ? 3 : 2) : 4)
   }
 
   /// Re-arm the tap WITHOUT touching the device, for settings that only change how frames are built.
