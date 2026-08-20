@@ -508,6 +508,13 @@ final class DeckLinkVideoTap {
     return occupancyEMA
   }
 
+  /// The depth the queue is currently allowed to reach, so a servo can aim at something reachable.
+  var queueDepthNow: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return filmQueueDepth
+  }
+
   var weaveStarved: Bool {
     lock.lock()
     defer { lock.unlock() }

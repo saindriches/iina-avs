@@ -2474,7 +2474,11 @@ class PlayerCore: NSObject {
   func speedChanged(_ speed: Double) {
     guard info.state.active else { return }
     info.playSpeed = speed
-    sendOSD(.speed(speed))
+    // DeckLink's clock matching rewrites the speed every second by a fraction of a percent. An OSD
+    // for each of those flashes over the picture for a change nobody made.
+    if DeckLinkController.shared.shouldShowSpeedOSD(speed) {
+      sendOSD(.speed(speed))
+    }
     mainWindow.updateSpeedLabel(speed: speed)
     postNotification(.iinaSpeedChanged)
     NowPlayingInfoManager.shared.updateInfo()

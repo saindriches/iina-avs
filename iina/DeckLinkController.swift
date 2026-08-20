@@ -177,6 +177,8 @@ class DeckLinkController {
   private var speedTrim: Double = 0
   private var baseSpeed: Double?
   private var speedWeWrote: Double?
+  /// Occupancy at the previous tick, so the servo can see which way it is going.
+  private var lastOccupancy: Double?
 
   /// True while the cadence is not merely asked for but running, which needs a source that really
   /// is 2/5 of the field rate. Surfaced so the panel can say so instead of leaving it ambiguous.
@@ -317,6 +319,18 @@ class DeckLinkController {
   /// value whenever the measured latency moves, and flashing "Audio Delay" over the video for a
   /// change the user did not make is just noise. Matching on the value rather than holding a flag
   /// keeps it self-limiting, since the observer arrives asynchronously and might not arrive at all.
+  /// Whether a speed change deserves an OSD. Ours do not: the clock servo rewrites it every second
+  /// by a fraction of a percent, and flashing the speed over the video for a correction the user
+  /// did not ask for is noise. Same value-matching approach as the audio delay, and self-limiting
+  /// for the same reason: the observer is asynchronous and might not arrive at all.
+  func shouldShowSpeedOSD(_ value: Double) -> Bool {
+    if let ours = speedWeWrote, abs(ours - value) < 0.00005 {
+      speedWeWrote = nil
+      return false
+    }
+    return true
+  }
+
   func shouldShowAudioDelayOSD(_ value: Double) -> Bool {
     if let ours = audioDelayWeWrote, abs(ours - value) < 0.0005 {
       audioDelayWeWrote = nil
@@ -685,6 +699,7 @@ class DeckLinkController {
     }
     baseSpeed = nil
     speedTrim = 0
+    lastOccupancy = nil
   }
 
   /// One step of the servo, from the same one second tick as everything else.
@@ -705,8 +720,20 @@ class DeckLinkController {
     // than fighting them.
     if let wrote = speedWeWrote, abs(current - wrote) > 0.0005 { baseSpeed = current; speedTrim = 0 }
 
-    let target = 2.0
-    let error = tap.queueOccupancy - target      // negative means draining, so play faster
+    // Null the DRIFT, not a level. Holding a level was wrong twice over: occupancy is sampled
+    // after the pull so it reads about one less than the depth, and the depth caps it anyway, so a
+    // target of two was unreachable whenever the queue sat at its floor of two. The loop then wound
+    // to its clamp and stayed there, which says nothing about the real clock difference. Reported
+    // as exactly that: pinned at +3000 ppm with no visible effect either way.
+    //
+    // What actually needs cancelling is the queue trending, so the trend is the error. A level term
+    // stays, weak, and aimed at something the queue can reach, purely to stop it parking empty or
+    // against the cap where it would hold or drop.
+    let occupancy = tap.queueOccupancy
+    let drift = occupancy - (lastOccupancy ?? occupancy)
+    lastOccupancy = occupancy
+    let level = max(1.0, Double(tap.queueDepthNow) - 1.0)
+    let error = drift * 4.0 + (occupancy - level) * 0.25
     speedTrim = max(-0.003, min(0.003, speedTrim - error * 0.0002))
     let wanted = (baseSpeed ?? 1.0) * (1.0 + speedTrim)
     if abs(current - wanted) > 0.00005 {
