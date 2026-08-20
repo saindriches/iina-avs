@@ -421,10 +421,13 @@ final class DeckLinkVideoTap {
 
   /// Frames whose two fields came from DIFFERENT source frames.
   ///
-  /// At or below half the field rate this must be zero: one source frame per output frame means
-  /// both fields are the same moment. Anything else means the phase has slipped and frames are
-  /// being built from two different moments, which for already-interlaced content mixes two combed
-  /// frames and reads exactly like an inverted field order.
+  /// Counted only AT half the field rate, where one source frame per output frame means both fields
+  /// are the same moment, so anything else means the phase has slipped and frames are being built
+  /// from two different moments: for already-interlaced content that mixes two combed frames and
+  /// reads exactly like an inverted field order. There it must be zero.
+  ///
+  /// Below a half two moments in one raster is the cadence working, not a fault, so those are left
+  /// out rather than reported as a fault that needs no fixing.
   private(set) var mixedFrames = 0
   /// Frames discarded because the queue was full. See the comment where it is incremented.
   private(set) var queueDrops = 0
@@ -1583,7 +1586,12 @@ final class DeckLinkVideoTap {
     if stepCadenceSlot() { pullCadenceFrame() }
     let secondSource = current
     let mixed = sourceConsumed != consumedBefore
-    if mixed { mixedFrames += 1 }
+    // Counted only where it is a fault. Below a half a leading-step pull is the telecine pattern
+    // itself: at 0.4 the pull falls on the leading step of 160 frames in every 400, which is the 2:3
+    // of film and exactly what the cadence exists to produce. Counting those would put a four figure
+    // number next to the word mixed on ordinary film content and bury the case that matters.
+    // The trace flag below is NOT gated, so the per-frame truth is still in the ring either way.
+    if mixed, cadenceIsOneToOne { mixedFrames += 1 }
     // The leading-step pull is the tell for a slipped phase: at or below half the field rate it
     // should never happen, because the wrap belongs on the trailing step.
     record(kind: 1, flags: mixed ? 0b10010 : 0,
