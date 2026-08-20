@@ -342,34 +342,60 @@ final class DeckLinkVideoTap {
     var consumed: Int32 = 0
     var fieldA: Int32 = 0      // source index into the field sent FIRST
     var fieldB: Int32 = 0
+    /// Speed trim in ppm at the time of the record, so the servo is visible next to what it is
+    /// steering. Without it a queue excursion cannot be told from the correction chasing it.
+    var trimPPM: Int32 = 0
   }
   private var trace = [TraceRecord](repeating: TraceRecord(), count: 8192)
   private var traceHead = 0
+
+  /// Set by the controller each tick, purely so the trace can show it.
+  var reportedTrimPPM: Int32 = 0
 
   private func record(kind: UInt8, flags: UInt8, fieldA: Int32 = -1, fieldB: Int32 = -1) {
     trace[traceHead % trace.count] = TraceRecord(
       time: CACurrentMediaTime(), kind: kind, flags: flags,
       queue: UInt16(min(filmReady.count, Int(UInt16.max))), phase: Float(cadenceAcc),
-      consumed: Int32(truncatingIfNeeded: sourceConsumed), fieldA: fieldA, fieldB: fieldB)
+      consumed: Int32(truncatingIfNeeded: sourceConsumed), fieldA: fieldA, fieldB: fieldB,
+      trimPPM: reportedTrimPPM)
     traceHead &+= 1
   }
 
   /// Oldest first, as CSV. Taken under the lock so it cannot tear against the GL or feeder threads.
+  /// Oldest first, fixed width so a row never wraps and the columns line up when read as text.
+  ///
+  /// Still comma separated, so awk and spreadsheets take it, but padded: a trace is read by eye far
+  /// more often than by a parser. Five separate zero-or-one columns for the flags were both wide
+  /// and hard to scan, so they collapse to one letter each.
+  ///
+  /// Ordered the way a frame travels: when it happened, what happened, how deep the queue was,
+  /// where the cadence phase sat, and which source frames landed in which field. The trim comes
+  /// last because it is context for the rest rather than part of the event.
+  ///
+  /// Taken under the lock so it cannot tear against the GL or feeder threads.
   func traceCSV() -> String {
     lock.lock()
     defer { lock.unlock() }
-    var out = "t,kind,hold,mixed,dup,catchup,leadstep,queue,phase,consumed,fieldA,fieldB\n"
+    var out = "       t, knd, flg,  q,  phase, consumed, fldA, fldB,  trim\n"
     let total = min(traceHead, trace.count)
-    let start = traceHead >= trace.count ? traceHead % trace.count : 0
-    let base = total > 0 ? trace[start].time : 0
+    let first = traceHead >= trace.count ? traceHead % trace.count : 0
+    let base = total > 0 ? trace[first].time : 0
     for i in 0..<total {
-      let r = trace[(start + i) % trace.count]
-      let kind = ["", "compose", "capture", "handout"][Int(min(r.kind, 3))]
-      out += String(format: "%.6f,%@,%d,%d,%d,%d,%d,%d,%.4f,%d,%d,%d\n",
-                    r.time - base, kind,
-                    r.flags & 1, (r.flags >> 1) & 1, (r.flags >> 2) & 1,
-                    (r.flags >> 3) & 1, (r.flags >> 4) & 1,
-                    Int(r.queue), r.phase, Int(r.consumed), Int(r.fieldA), Int(r.fieldB))
+      let r = trace[(first + i) % trace.count]
+      let kind = ["?", "cmp", "cap", "out"][Int(min(r.kind, 3))]
+      // h hold, m mixed, d duplicate, c catch-up, L pull landed on the leading step
+      var flags = ""
+      if r.flags & 1 != 0 { flags += "h" }
+      if (r.flags >> 1) & 1 != 0 { flags += "m" }
+      if (r.flags >> 2) & 1 != 0 { flags += "d" }
+      if (r.flags >> 3) & 1 != 0 { flags += "c" }
+      if (r.flags >> 4) & 1 != 0 { flags += "L" }
+      if flags.isEmpty { flags = "-" }
+      let a = r.fieldA < 0 ? "-" : String(r.fieldA)
+      let b = r.fieldB < 0 ? "-" : String(r.fieldB)
+      out += String(format: "%8.3f, %3@, %3@, %2d, %6.4f, %8d, %4@, %4@, %5d\n",
+                    r.time - base, kind as NSString, flags as NSString, Int(r.queue), r.phase,
+                    Int(r.consumed), a as NSString, b as NSString, Int(r.trimPPM))
     }
     return out
   }

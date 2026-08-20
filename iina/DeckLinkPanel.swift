@@ -650,7 +650,7 @@ class DeckLinkPanelController: NSWindowController {
                        dl.smoothedLatency * 1000.0, dl.bufferedFrames)
     if dl.compensateAudio { delay += ", audio matched" }
     if dl.matchCardClock, dl.clockTrimPPM != 0 {
-      delay += String(format: ", clock %+ld ppm", dl.clockTrimPPM)
+      delay += String(format: ", clk %+ldppm", dl.clockTrimPPM)
     }
     lines.append(delay)
 

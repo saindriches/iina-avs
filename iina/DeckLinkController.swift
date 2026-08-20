@@ -732,6 +732,7 @@ class DeckLinkController {
     let occupancy = tap.queueOccupancy
     let level = 2.0
     speedTrim = max(-0.003, min(0.003, (level - occupancy) * 0.0015))
+    tap.reportedTrimPPM = Int32(clockTrimPPM)
     let wanted = (baseSpeed ?? 1.0) * (1.0 + speedTrim)
     if abs(current - wanted) > 0.00005 {
       speedWeWrote = wanted
