@@ -743,14 +743,22 @@ class DeckLinkController {
     let produced = tap.capturedFrames
     let consumed = tap.consumedFrames
     let occupancy = tap.queueOccupancy
+    // Sixty seconds, not ten. The measurement is a difference of two frame COUNTS, so it is
+    // quantised: over ten seconds there are only three hundred frames and a single frame of
+    // difference is 3337 ppm, nearly three times the signal being measured. Accumulating that made
+    // the trim random-walk by thousands of ppm, which is what the last trace shows. A minute brings
+    // one frame down to 556 ppm, and taking only part of each measurement averages the rest away.
     clockWindowTicks += 1
-    if let p0 = lastProduced, let c0 = lastConsumed, clockWindowTicks >= 10 {
+    if let p0 = lastProduced, let c0 = lastConsumed, clockWindowTicks >= 60 {
       let dProduced = Double(produced - p0)
       let dConsumed = Double(consumed - c0)
-      if dProduced > 30 {
-        // Positive means the card took more than mpv made, so mpv has to run faster.
+      if dProduced > 500 {
+        // Positive means the card took more than mpv made, so mpv has to run faster. Only part of
+        // it is applied, and the step is capped, so counting noise averages out over a few windows
+        // instead of throwing the trim across its whole range on one noisy reading.
         let rateError = (dConsumed - dProduced) / dProduced
-        speedTrim = max(-0.003, min(0.003, speedTrim + rateError))
+        let step = max(-0.0005, min(0.0005, rateError * 0.5))
+        speedTrim = max(-0.003, min(0.003, speedTrim + step))
       }
       lastProduced = produced
       lastConsumed = consumed
