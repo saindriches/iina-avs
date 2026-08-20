@@ -201,6 +201,9 @@ class DeckLinkController {
   /// field rate; anything else means the cadence phase has slipped.
   var mixedFrames: Int { tap.mixedFrames }
 
+  /// Frames discarded on queue overflow, the mirror of a hold.
+  var queueDrops: Int { tap.queueDrops }
+
   /// Write the trace ring somewhere the user can find and send it.
   ///
   /// Release builds only ever have the panel, so the dump has to be a button rather than a debugger
@@ -745,7 +748,7 @@ class DeckLinkController {
     // back toward the middle if it settles too near empty or too near the cap. It is far too slow
     // to oscillate against anything.
     let produced = tap.capturedFrames
-    let consumed = tap.consumedFrames
+    let consumed = tap.cadenceHolds - tap.queueDrops
     let occupancy = tap.queueOccupancy
     // Sixty seconds, not ten. The measurement is a difference of two frame COUNTS, so it is
     // quantised: over ten seconds there are only three hundred frames and a single frame of
@@ -755,10 +758,18 @@ class DeckLinkController {
     clockWindowTicks += 1
     if let p0 = lastProduced, let c0 = lastConsumed, clockWindowTicks >= 60 {
       let dProduced = Double(produced - p0)
-      let dConsumed = Double(consumed - c0)
+      let dShortfall = Double(consumed - c0)      // holds minus drops over the window
       if dProduced > 500 {
-        // Positive means the card took more than mpv made, so mpv has to run faster.
-        let rateError = (dConsumed - dProduced) / dProduced
+        // HOLDS MINUS DROPS, not produced minus consumed. Those two totals are equal by
+        // construction, because every frame made is eventually taken and their difference is only
+        // the queue level, which is bounded to a handful. Dividing a bounded number by eighteen
+        // hundred gave noise with a random sign, which is why one session settled at +1830 ppm and
+        // another at -1700, and why the last one sat at -2224 while the queue was starving.
+        //
+        // A hold is consumption finding nothing: production fell short by exactly one frame. A drop
+        // is the queue overflowing: production ran over by one. Their difference over a window IS
+        // the rate error, in the same units, and it is the only place the difference is observable.
+        let rateError = dShortfall / dProduced
         // Take the first measurement whole. Starting from nothing, the damping that keeps later
         // corrections quiet just makes acquisition crawl: several minutes to reach a figure the
         // very first window already knew to within its noise.

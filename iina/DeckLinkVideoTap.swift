@@ -407,6 +407,8 @@ final class DeckLinkVideoTap {
   /// being built from two different moments, which for already-interlaced content mixes two combed
   /// frames and reads exactly like an inverted field order.
   private(set) var mixedFrames = 0
+  /// Frames discarded because the queue was full. See the comment where it is incremented.
+  private(set) var queueDrops = 0
 
   /// Move on to the next source frame, or record that there was not one to move to.
   private func pullCadenceFrame() {
@@ -925,6 +927,7 @@ final class DeckLinkVideoTap {
     capturedFrames = 0
     publishedFrames = 0
     mixedFrames = 0
+    queueDrops = 0
     duplicatesOut = 0
     publishSerial = 0
     lastHandedSerial = -1
@@ -1075,7 +1078,13 @@ final class DeckLinkVideoTap {
       record(kind: 2, flags: 0)
       // Bound the queue. Dropping the OLDEST keeps latency fixed and loses the frame furthest from
       // what should be on screen, which only happens if the card has stopped consuming.
-      while filmReady.count > filmQueueDepth { filmSpare.append(filmReady.removeFirst()) }
+      while filmReady.count > filmQueueDepth {
+        filmSpare.append(filmReady.removeFirst())
+        // The mirror image of a hold: production outran consumption by one frame and the oldest is
+        // discarded. Counted because holds and drops are the only places a rate difference becomes
+        // visible; the produced and consumed totals cannot show it, being equal by construction.
+        queueDrops &+= 1
+      }
       hasFrame = true
       frameComplete = true
       capturedFrames += 1
