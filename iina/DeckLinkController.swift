@@ -807,10 +807,22 @@ class DeckLinkController {
     // Inside the band the rate measurement is the only thing with a vote, which is right, because
     // it is the only one measuring the quantity that matters. The nudge exists solely to walk the
     // queue back when it parks near empty or against the cap.
+    // Asymmetric, because the two directions do not cost the same.
+    //
+    // With the rate error now measured properly it turns out to be tens of ppm, not thousands, so
+    // the nudge is the strongest thing in the loop and its behaviour decides the outcome. A trace
+    // showed the queue sitting full for thirty seconds while the nudge walked the trim down 90 ppm,
+    // and then the queue drained to empty and held. Running dry costs a repeated frame in
+    // field-rate motion; sitting full costs 33 ms of delay. Those are not equal, so the response
+    // should not be either.
+    //
+    // Quick to fill, slow to drain: full strength when the queue is low, a third of it when high.
     let occupancyLow = 1.5, occupancyHigh = 3.5
-    if occupancy < occupancyLow || occupancy > occupancyHigh {
-      let level = 2.5
+    let level = 2.5
+    if occupancy < occupancyLow {
       speedTrim = max(-0.003, min(0.003, speedTrim + (level - occupancy) * 0.000002))
+    } else if occupancy > occupancyHigh {
+      speedTrim = max(-0.003, min(0.003, speedTrim + (level - occupancy) * 0.0000007))
     }
     tap.reportedTrimPPM = Int32(clockTrimPPM)
     let wanted = (baseSpeed ?? 1.0) * (1.0 + speedTrim)
