@@ -477,7 +477,16 @@ final class DeckLinkVideoTap {
       // is why re-arming the tap fixed the field order and why ANY setting that re-arms it worked,
       // the interline filter included, in either direction. Re-anchor here instead, so the cycle
       // recovers by itself rather than waiting for someone to toggle something.
-      cadenceAcc = 0
+      //
+      // Only where one frame makes one frame, for the same reason the frame-start anchor is. There
+      // an offset phase inverts the field order and the reset is free, since the two steps sum to
+      // exactly one and land back where they started. Below a half nothing is inverted, because two
+      // moments in a raster IS the pattern, so the reset fixes nothing and throws away whatever
+      // phase had accumulated: measured on 23.98p, a hold discarded 0.6 of a slot and the next pull
+      // came a frame late, leaving one source frame across five fields where 2:3 allows three.
+      // Leaving the phase alone through a hold costs the one repeat the starvation already forced
+      // and no more.
+      if cadenceIsOneToOne { cadenceAcc = 0 }
       fieldParity = 0
       return
     }
