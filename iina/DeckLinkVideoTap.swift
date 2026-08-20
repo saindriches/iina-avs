@@ -317,6 +317,13 @@ final class DeckLinkVideoTap {
     return effectiveSourceRateLocked <= fieldRate * 1.01
   }
 
+  /// One source frame makes exactly one output frame, so both fields are the same moment.
+  ///
+  /// The pivot for two separate rules, which is why it is named once rather than tested twice: it is
+  /// the only ratio where the phase has to be anchored to the frame boundary, and the only one where
+  /// a frame carrying two moments is a fault rather than the cadence doing its job.
+  private var cadenceIsOneToOne: Bool { abs(cadenceRatioLocked - 0.5) <= 0.001 }
+
   /// Advance one field slot. True when the slot crosses into the next source frame.
   private func stepCadenceSlot() -> Bool {
     cadenceAcc += cadenceRatioLocked
@@ -1555,9 +1562,19 @@ final class DeckLinkVideoTap {
     // definition, so a leading-step wrap is not a phase to preserve but an error to clear. Resetting
     // costs a single frame once, against an inversion that otherwise lasts as long as playback.
     //
-    // Ratios above a half are left alone: there a leading-step wrap is legitimate, since those
-    // frames are supposed to carry two moments.
-    if cadenceRatioLocked <= 0.5 + 0.001, cadenceAcc + cadenceRatioLocked >= 1.0 - 1e-6 {
+    // Only AT a half, not at or below it. Below a half the two steps sum to less than one, so
+    // zeroing the accumulator throws away progress that no later step gives back: the frame ends at
+    // 2r, the next frame's test fires again for any r at or above a third, and the wrap is
+    // pre-empted forever. Consumption then stops completely while the queue fills, which measured
+    // as three frozen runs of 70, 32 and 31 frames in one 137 second trace, the ratio sitting at
+    // 0.4731 with five frames queued. Simulated over the ratios that matter: 0.4 for 23.98p, 0.4004
+    // for 24p and 0.4171 for 25p all pull ZERO frames under the wider test and the correct 2r per
+    // frame under this one.
+    //
+    // Ratios either side of a half are left alone. Above, a leading-step wrap is legitimate, since
+    // those frames are supposed to carry two moments; below, it is the telecine pattern itself, the
+    // 2:3 of film, and there is nothing to correct.
+    if cadenceIsOneToOne, cadenceAcc + cadenceRatioLocked >= 1.0 - 1e-6 {
       cadenceAcc = 0
     }
 
