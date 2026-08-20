@@ -767,7 +767,13 @@ class DeckLinkController {
       lastProduced = produced
       lastConsumed = consumed
     }
-    let level = 2.0
+    // Aim ABOVE two, not below it. The rate is handled by measurement, so the queue exists only to
+    // absorb jitter, and the tempting conclusion is to run it as shallow as possible. Observation
+    // says otherwise: the drops arrive as the delay falls through about 66 ms, which is one frame
+    // in hand plus the frame on air, so what matters is not the average depth but how close the
+    // dips come to empty. Aiming at one and a half parks the queue in exactly that band. Two and a
+    // half leaves the troughs at one or two instead of at zero, and costs about 33 ms for it.
+    let level = 2.5
     speedTrim = max(-0.003, min(0.003, speedTrim + (level - occupancy) * 0.00002))
     tap.reportedTrimPPM = Int32(clockTrimPPM)
     let wanted = (baseSpeed ?? 1.0) * (1.0 + speedTrim)
@@ -1012,6 +1018,9 @@ class DeckLinkController {
                  // so it needs no cushion beyond the one frame being assembled.
                  // Three when the clock servo is running: it aims the queue at two frames, and a
                  // depth of two caps occupancy below its own target.
+                 // Three while the clock is being matched, so the queue can actually sit at the
+                 // two and a half it aims for; a depth of two would cap it below its own target,
+                 // which is the mistake that made an earlier reading meaningless.
                  queueDepth: lowLatency ? (matchCardClock ? 3 : 2) : 4)
   }
 

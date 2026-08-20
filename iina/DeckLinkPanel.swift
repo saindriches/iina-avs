@@ -569,7 +569,11 @@ class DeckLinkPanelController: NSWindowController {
     }
     // Deliberately NOT the mode name or size: the Video Mode row directly below already says both,
     // and repeating them was what pushed this line onto a second row.
-    var lines = ["signal  " + raster]
+    // Whether a frame carries one moment or two belongs here, describing the signal, rather than
+    // tacked onto the build line where it was the thing pushing that line into a second row.
+    var signal = raster
+    if mode.isInterlaced, !dl.fieldOrderHasEffect { signal += ", one moment/frame" }
+    var lines = ["signal  " + signal]
 
     // -- build, and the capture rate the chosen scheme implies.
     let fieldRate = mode.fps * 2.0
@@ -582,17 +586,15 @@ class DeckLinkPanelController: NSWindowController {
       if abs(rates.reported - rates.effective) > 0.05 {
         // Say both, because a cadence planned against a rate the file did not mean is exactly the
         // case worth seeing, and it is invisible otherwise.
-        build = String(format: "cadence %.2f fps (file says %.2f), %ld holds",
-                       rates.effective, rates.reported, dl.cadenceHolds)
+        build = String(format: "cadence %.2f/%.2f (file %.2f), holds %ld",
+                       rates.effective, fieldRate, rates.reported, dl.cadenceHolds)
       } else {
-        build = String(format: "cadence %.2f fps into %.2f fields, %ld holds",
+        build = String(format: "cadence %.2f/%.2f, holds %ld",
                        rates.effective, fieldRate, dl.cadenceHolds)
       }
-      if !dl.fieldOrderHasEffect {
-        // If this says one moment per frame, `mixed` must stay at zero. A rising count there is
-        // the phase having slipped, which is the thing that reads as a flipped field order.
-        build += String(format: ", one moment per frame, mixed %ld", dl.mixedFrames)
-      }
+      // `mixed` must stay at zero whenever a frame carries one moment. A rising count is the phase
+      // having slipped, which is what reads as a flipped field order.
+      build += String(format: ", mixed %ld", dl.mixedFrames)
     } else if dl.weaveStarved {
       // Only as many distinct moments a second as the source has frames, so field-rate motion
       // cannot be made however it is sampled.
