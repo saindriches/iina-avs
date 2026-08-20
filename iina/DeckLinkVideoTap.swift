@@ -245,6 +245,18 @@ final class DeckLinkVideoTap {
   private var effectiveSourceRateLocked: Double {
     guard sourceFrameRate > 0 else { return sourceFrameRate }
     guard hookIntervalEMA > 0 else { return sourceFrameRate }
+    // Not until the draw loop has been running long enough to be worth believing.
+    //
+    // This is what produced a session that never had the right field order. On a RE-ARM the average
+    // draw interval carries whatever the window was doing while it started, so the observed rate
+    // reads far too low; the ratio was then latched from it and stayed wrong for the whole session.
+    // A trace caught it at 0.4041 instead of a half, which is 24.2 fps for a 29.97 file, and at
+    // that ratio the wrap lands on the leading step and every frame mixes two moments. Restarting
+    // re-latched it, which is why another restart appeared to fix it.
+    //
+    // Ten seconds of draws is plenty to tell soft telecine from a window that has just woken up,
+    // and the reported rate is the right answer in the meantime.
+    guard hookCalls >= 300 else { return sourceFrameRate }
     let observed = 1.0 / hookIntervalEMA
     guard observed < sourceFrameRate * 0.95, observed > sourceFrameRate * 0.2 else {
       return sourceFrameRate
@@ -589,6 +601,15 @@ final class DeckLinkVideoTap {
     lock.lock()
     defer { lock.unlock() }
     return cadenceEngagedLocked && cadenceRatioLocked > 0.5 + 0.001
+  }
+
+  /// Recompute the latched ratio. Safe to call repeatedly: it snaps, so a settled source gives the
+  /// same answer every time.
+  func refreshCadenceRatio() {
+    lock.lock()
+    refreshCadenceRatioLocked()
+    updateSampleIntervalLocked()
+    lock.unlock()
   }
 
   /// mpv's reported frame rate for the current file, which can change when the file does.

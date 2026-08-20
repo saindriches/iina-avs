@@ -927,7 +927,12 @@ class DeckLinkController {
     tap.updateSourceFrameRate(routedSourceFrameRate())
     let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
       guard let self = self else { return }
+      // Re-derive the cadence ratio every tick as well as on a rate change. It snaps to the simple
+      // fraction it means, so for settled playback this is the same value every time and costs
+      // nothing; what it buys is that a ratio latched from a bad early measurement corrects itself
+      // instead of persisting for the whole session.
       self.tap.updateSourceFrameRate(self.routedSourceFrameRate())
+      self.tap.refreshCadenceRatio()
       self.refreshSourceGeometry()
       self.updateLinePlacement()
       let now = self.estimatedLatency
