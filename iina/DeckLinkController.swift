@@ -181,6 +181,9 @@ class DeckLinkController {
   private var lastProduced: Int?
   private var lastConsumed: Int?
   private var clockWindowTicks = 0
+  /// Whether the first full measurement has been taken, so acquisition can be immediate and
+  /// tracking afterwards can be gentle.
+  private var hasAcquiredClock = false
 
   /// True while the cadence is not merely asked for but running, which needs a source that really
   /// is 2/5 of the field rate. Surfaced so the panel can say so instead of leaving it ambiguous.
@@ -704,6 +707,7 @@ class DeckLinkController {
     lastProduced = nil
     lastConsumed = nil
     clockWindowTicks = 0
+    hasAcquiredClock = false
   }
 
   /// One step of the servo, from the same one second tick as everything else.
@@ -753,12 +757,18 @@ class DeckLinkController {
       let dProduced = Double(produced - p0)
       let dConsumed = Double(consumed - c0)
       if dProduced > 500 {
-        // Positive means the card took more than mpv made, so mpv has to run faster. Only part of
-        // it is applied, and the step is capped, so counting noise averages out over a few windows
-        // instead of throwing the trim across its whole range on one noisy reading.
+        // Positive means the card took more than mpv made, so mpv has to run faster.
         let rateError = (dConsumed - dProduced) / dProduced
-        let step = max(-0.0005, min(0.0005, rateError * 0.5))
-        speedTrim = max(-0.003, min(0.003, speedTrim + step))
+        // Take the first measurement whole. Starting from nothing, the damping that keeps later
+        // corrections quiet just makes acquisition crawl: several minutes to reach a figure the
+        // very first window already knew to within its noise.
+        if !hasAcquiredClock {
+          speedTrim = max(-0.003, min(0.003, speedTrim + rateError))
+          hasAcquiredClock = true
+        } else {
+          let step = max(-0.0005, min(0.0005, rateError * 0.5))
+          speedTrim = max(-0.003, min(0.003, speedTrim + step))
+        }
       }
       lastProduced = produced
       lastConsumed = consumed
@@ -773,8 +783,21 @@ class DeckLinkController {
     // in hand plus the frame on air, so what matters is not the average depth but how close the
     // dips come to empty. Aiming at one and a half parks the queue in exactly that band. Two and a
     // half leaves the troughs at one or two instead of at zero, and costs about 33 ms for it.
-    let level = 2.5
-    speedTrim = max(-0.003, min(0.003, speedTrim + (level - occupancy) * 0.00002))
+    // The level nudge only outside a deadband, and an order of magnitude weaker.
+    //
+    // At its old strength it moved the trim 10 ppm a second, 600 a minute, against a rate term that
+    // can correct 500 a minute and only fires once. So the nudge outvoted the measurement: one
+    // session settled at +1830 ppm and another at -1700 for the same hardware, each following
+    // wherever the queue happened to sit rather than the actual clock difference.
+    //
+    // Inside the band the rate measurement is the only thing with a vote, which is right, because
+    // it is the only one measuring the quantity that matters. The nudge exists solely to walk the
+    // queue back when it parks near empty or against the cap.
+    let occupancyLow = 1.5, occupancyHigh = 3.5
+    if occupancy < occupancyLow || occupancy > occupancyHigh {
+      let level = 2.5
+      speedTrim = max(-0.003, min(0.003, speedTrim + (level - occupancy) * 0.000002))
+    }
     tap.reportedTrimPPM = Int32(clockTrimPPM)
     let wanted = (baseSpeed ?? 1.0) * (1.0 + speedTrim)
     if abs(current - wanted) > 0.00005 {
