@@ -458,7 +458,16 @@ final class DeckLinkVideoTap {
     // nobody asked for. Give one back, slowly, so it settles at the least that works.
     framesSinceHold += 1
     minOccupancySinceHold = min(minOccupancySinceHold, filmReady.count)
-    occupancyEMA = occupancyEMA * 0.995 + Double(filmReady.count) * 0.005
+    // Fast on purpose. These coefficients used to give a time constant near seven seconds, which
+    // put a second pole in the clock servo's loop: an integrating plant plus a laggy sensor
+    // oscillates, and the predicted period, sqrt(gain over tau), came out around eighty seconds.
+    // A trace showed exactly that, the queue swinging between one and two frames while the trim
+    // swung between zero and fourteen hundred ppm, over an eighty-five second cycle.
+    //
+    // Half a second instead. The sensor then contributes no meaningful lag, the loop is a plain
+    // integrator under proportional control, and that cannot oscillate at any stable gain. It is
+    // still slow next to the queue it watches, so it does not pass frame-to-frame noise through.
+    occupancyEMA = occupancyEMA * 0.94 + Double(filmReady.count) * 0.06
     // Only give a frame back with evidence that it was spare: the queue has to have kept something
     // in hand for the whole run. A run that merely avoided holding says nothing, since it may have
     // been reaching empty every time and getting away with it.
