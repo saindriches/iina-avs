@@ -429,6 +429,9 @@ final class DeckLinkVideoTap {
   /// Below a half two moments in one raster is the cadence working, not a fault, so those are left
   /// out rather than reported as a fault that needs no fixing.
   private(set) var mixedFrames = 0
+  /// Output frames in a row that took no source frame. Only interesting when it runs longer than
+  /// the ratio allows, which is the tell for a stalled cadence. See where it is checked.
+  private var framesWithoutPull = 0
   /// Frames discarded because the queue was full. See the comment where it is incremented.
   private(set) var queueDrops = 0
 
@@ -958,6 +961,7 @@ final class DeckLinkVideoTap {
     capturedFrames = 0
     publishedFrames = 0
     mixedFrames = 0
+    framesWithoutPull = 0
     queueDrops = 0
     duplicatesOut = 0
     publishSerial = 0
@@ -1618,6 +1622,33 @@ final class DeckLinkVideoTap {
 
     // Step on to the next output frame's first slot, so `current` is already right when it arrives.
     if stepCadenceSlot() { pullCadenceFrame() }
+
+    // A stalled cadence is a silent duplicate, and nothing else here could see it.
+    //
+    // The handout path counts a repeat by comparing serials, but the cadence path returns before it
+    // on the grounds that it builds a new frame every time. That is only true while the phase keeps
+    // moving. A phase that stops advancing rebuilds the same source frame indefinitely, and it
+    // measured as three runs of 70, 32 and 31 output frames in one trace, all of them reported as
+    // new, with frames waiting in the queue the whole time.
+    //
+    // Frames that take nothing are normal below a half: at 0.4 one source frame spans two output
+    // frames, which is the 3 in 3:2. So the test is the RUN, against what the ratio allows. With 2r
+    // pulls per frame the gap between pulls cannot exceed ceil(1 / 2r) frames, so anything longer is
+    // the cadence stuck rather than the cadence spread out. At a half the allowance is zero, since
+    // every frame there takes exactly one.
+    //
+    // Only while the queue has something to take: with an empty queue a repeat is starvation, which
+    // is a hold and is already counted as one.
+    if sourceConsumed == consumedBefore {
+      framesWithoutPull += 1
+      let gap = cadenceRatioLocked > 0 ? (1.0 / (2.0 * cadenceRatioLocked)).rounded(.up) : 1.0
+      if Double(framesWithoutPull) > gap - 1, !filmReady.isEmpty {
+        duplicatesOut += 1
+        record(kind: 1, flags: 0b100)
+      }
+    } else {
+      framesWithoutPull = 0
+    }
   }
 
   /// Copy the most recent captured frame into the feeder's buffer.
@@ -1631,7 +1662,7 @@ final class DeckLinkVideoTap {
     if cadenceEngagedLocked, current.count == width * height * 4 {
       composeCadenceFrame(into: destination, width: width, height: height, stride: stride)
       publishedFrames += 1
-      return true   // the cadence builds a new frame every time, so it can never be a duplicate
+      return true   // a repeat inside the cadence is caught where it is built, not by serial here
     }
 
     if publishSerial == lastHandedSerial {
