@@ -91,6 +91,38 @@ static IDeckLinkOutput *DLOutputFor(IDeckLink *dl) {
 // works in the 0..1023 domain end to end. Matrix is BT.709; SMPTE range maps to Y 64..940 /
 // C 64..960, full range keeps 0..1023. 4:2:2 averages chroma across each pair.
 
+#include <mach/mach_init.h>
+#include <mach/mach_time.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+
+/// Ask the scheduler to treat this thread as having a hard deadline.
+///
+/// The display loop must be running when the card's frame boundary arrives. It usually is, but a
+/// trace over 137 seconds caught fifteen gaps longer than 50 ms, up to 100.6 ms, with the queue
+/// sitting at three or four frames the whole time: nothing was starved, the thread simply was not
+/// scheduled, so the boundary went by and the loop took the next one. That is a visible hitch every
+/// nine seconds or so, more often than anything else left here.
+///
+/// A time-constraint policy is what macOS provides for exactly this, and it is what audio and video
+/// engines use. The numbers describe one output frame: how often the work recurs, how much CPU it
+/// needs, and the deadline it must land inside.
+static void DLMakeThreadTimeConstrained(double frameSeconds) {
+  if (frameSeconds <= 0) return;
+  mach_timebase_info_data_t timebase;
+  if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0) return;
+  const double ticksPerSecond = 1e9 * (double)timebase.denom / (double)timebase.numer;
+  thread_time_constraint_policy_data_t policy;
+  policy.period = (uint32_t)(frameSeconds * ticksPerSecond);
+  // Packing 1920x1080 measured about 7.65 ms; ask for a little over that, and let the deadline be
+  // most of a frame so the scheduler has room to place it.
+  policy.computation = (uint32_t)(fmin(frameSeconds * 0.4, 0.010) * ticksPerSecond);
+  policy.constraint = (uint32_t)(fmin(frameSeconds * 0.8, 0.025) * ticksPerSecond);
+  policy.preemptible = 0;
+  thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY,
+                    (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+}
+
 namespace {
 
 struct Coeffs { double yScale, yOff, cScale, cOff; };
@@ -563,6 +595,8 @@ public:
 
 private:
   void loop() {
+    DLMakeThreadTimeConstrained(frameDuration_ && timeScale_
+                                ? (double)frameDuration_ / (double)timeScale_ : 0);
     BMDTimeValue lastIndex = -1;
     while (running_.load()) {
       if (!waitForNextOutputFrame(lastIndex)) return;
