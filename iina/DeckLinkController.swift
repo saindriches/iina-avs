@@ -177,6 +177,10 @@ class DeckLinkController {
   private var speedTrim: Double = 0
   private var baseSpeed: Double?
   private var speedWeWrote: Double?
+  /// Counters at the start of the current measurement window, and how many ticks it has run.
+  private var lastProduced: Int?
+  private var lastConsumed: Int?
+  private var clockWindowTicks = 0
 
   /// True while the cadence is not merely asked for but running, which needs a source that really
   /// is 2/5 of the field rate. Surfaced so the panel can say so instead of leaving it ambiguous.
@@ -697,6 +701,9 @@ class DeckLinkController {
     }
     baseSpeed = nil
     speedTrim = 0
+    lastProduced = nil
+    lastConsumed = nil
+    clockWindowTicks = 0
   }
 
   /// One step of the servo, from the same one second tick as everything else.
@@ -717,21 +724,43 @@ class DeckLinkController {
     // than fighting them.
     if let wrote = speedWeWrote, abs(current - wrote) > 0.0005 { baseSpeed = current; speedTrim = 0 }
 
-    // PROPORTIONAL, not integral. Occupancy is the integral of the rate error: feed in a trim and
-    // the level ramps. Controlling that with another integrator makes a double integrator, which
-    // has no damping and cannot settle, so it wound to one clamp, overshot, and wound to the other.
-    // Reported as exactly that: +3000 ppm, then -3000, repeating.
+    // MEASURE the rate error rather than servo on a level.
     //
-    // A first-order plant wants a first-order controller. Trim is now a direct function of how far
-    // occupancy sits from where it should, which settles instead of hunting. It settles with a
-    // droop, since holding a steady correction needs a steady offset, and that is fine: at this
-    // gain a tenth of a percent of clock error parks the queue less than a frame below target.
+    // Three tunings of a feedback loop here were each wrong, and the last trace shows why chasing
+    // it further is a poor bet: with the sensor lag removed the queue still swung 1.4 to 3.0 while
+    // the trim swung +800 to -1400. Something slower than the sensor is in the loop, almost
+    // certainly mpv's own response to a speed change, which is not instant. Every gain that is fast
+    // enough to hold the level is fast enough to oscillate against that delay.
     //
-    // Saturating now means something. Trim pinned AND the queue empty is a real clock difference
-    // larger than a third of a percent, rather than an artifact of an unreachable target.
+    // But the quantity actually wanted is not a level at all. It is the ratio between what the card
+    // consumes and what mpv produces, and both are counted already. Measured over a window long
+    // enough to be quiet, that ratio IS the correction, applied once rather than hunted for. No
+    // loop dynamics, so nothing to oscillate.
+    //
+    // A weak level term stays, an order of magnitude below the rate term, purely to walk the queue
+    // back toward the middle if it settles too near empty or too near the cap. It is far too slow
+    // to oscillate against anything.
+    let produced = tap.capturedFrames
+    let consumed = tap.consumedFrames
     let occupancy = tap.queueOccupancy
+    clockWindowTicks += 1
+    if let p0 = lastProduced, let c0 = lastConsumed, clockWindowTicks >= 10 {
+      let dProduced = Double(produced - p0)
+      let dConsumed = Double(consumed - c0)
+      if dProduced > 30 {
+        // Positive means the card took more than mpv made, so mpv has to run faster.
+        let rateError = (dConsumed - dProduced) / dProduced
+        speedTrim = max(-0.003, min(0.003, speedTrim + rateError))
+      }
+      lastProduced = produced
+      lastConsumed = consumed
+      clockWindowTicks = 0
+    } else if lastProduced == nil {
+      lastProduced = produced
+      lastConsumed = consumed
+    }
     let level = 2.0
-    speedTrim = max(-0.003, min(0.003, (level - occupancy) * 0.0015))
+    speedTrim = max(-0.003, min(0.003, speedTrim + (level - occupancy) * 0.00002))
     tap.reportedTrimPPM = Int32(clockTrimPPM)
     let wanted = (baseSpeed ?? 1.0) * (1.0 + speedTrim)
     if abs(current - wanted) > 0.00005 {

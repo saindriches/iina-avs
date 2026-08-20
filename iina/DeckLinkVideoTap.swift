@@ -543,6 +543,14 @@ final class DeckLinkVideoTap {
     return occupancyEMA
   }
 
+  /// Frames consumed by the cadence, cumulative. With `capturedFrames` this gives production and
+  /// consumption over any window, which is the rate error measured rather than inferred.
+  var consumedFrames: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return sourceConsumed
+  }
+
   /// The depth the queue is currently allowed to reach, so a servo can aim at something reachable.
   var queueDepthNow: Int {
     lock.lock()
