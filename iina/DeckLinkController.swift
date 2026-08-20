@@ -748,7 +748,7 @@ class DeckLinkController {
     // back toward the middle if it settles too near empty or too near the cap. It is far too slow
     // to oscillate against anything.
     let produced = tap.capturedFrames
-    let consumed = tap.cadenceHolds - tap.queueDrops
+    let consumed = tap.cadenceHolds - Int(Double(tap.queueDrops) * 0.7)
     let occupancy = tap.queueOccupancy
     // Sixty seconds, not ten. The measurement is a difference of two frame COUNTS, so it is
     // quantised: over ten seconds there are only three hundred frames and a single frame of
@@ -769,6 +769,9 @@ class DeckLinkController {
         // A hold is consumption finding nothing: production fell short by exactly one frame. A drop
         // is the queue overflowing: production ran over by one. Their difference over a window IS
         // the rate error, in the same units, and it is the only place the difference is observable.
+        // Drops count for slightly less than holds, which biases the resting point upward. Both
+        // are visible, but a hold repeats a frame in a picture that is meant to be moving at field
+        // rate, and the queue running dry is the failure that was actually reported.
         let rateError = dShortfall / dProduced
         // Take the first measurement whole. Starting from nothing, the damping that keeps later
         // corrections quiet just makes acquisition crawl: several minutes to reach a figure the
@@ -1052,10 +1055,12 @@ class DeckLinkController {
                  // so it needs no cushion beyond the one frame being assembled.
                  // Three when the clock servo is running: it aims the queue at two frames, and a
                  // depth of two caps occupancy below its own target.
-                 // Three while the clock is being matched, so the queue can actually sit at the
-                 // two and a half it aims for; a depth of two would cap it below its own target,
-                 // which is the mistake that made an earlier reading meaningless.
-                 queueDepth: lowLatency ? (matchCardClock ? 3 : 2) : 4)
+                 // Four while the clock is being matched. The loop settles where holds and drops
+                 // balance, and drops only begin at the depth, so the depth is what decides the
+                 // resting level: at three it settled at one frame, which is the band the drops
+                 // were observed in. One more frame moves the equilibrium up without changing
+                 // anything else, and costs 33 ms.
+                 queueDepth: lowLatency ? (matchCardClock ? 4 : 2) : 4)
   }
 
   /// Re-arm the tap WITHOUT touching the device, for settings that only change how frames are built.
