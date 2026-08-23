@@ -712,6 +712,25 @@ final class DeckLinkVideoTap {
     dst[index] = out
   }
 
+  /// Whether a readback has to go through `store` rather than straight into the published frame.
+  ///
+  /// The fast path exists to skip a whole-frame copy when there is genuinely nothing to do, and its
+  /// test was "not assembling", which missed everything else `store` is responsible for. With Low
+  /// Latency on, and that is the normal setting, PsF and pass-through took the fast path and lost:
+  /// the test pattern, which is why it appeared to work only in True Interlace; the one-line field
+  /// order shift, which the panel offers in pass-through and describes in its tooltip; and the row
+  /// placement that puts 480 lines inside a 486 raster, which is very likely the NTSC picture
+  /// sitting off centre until any toggle that happens to force this branch the other way.
+  ///
+  /// So the question is not "am I assembling" but "is anything I am responsible for going to
+  /// happen". Caller holds `lock`.
+  private var readbackNeedsStore: Bool {
+    if weaveFields || interlineFilter { return true }
+    if testPattern != .off { return true }
+    if sourceInterlaced, placedHeight > 0 || swapSourceFields { return true }
+    return false
+  }
+
   /// Draw the selected pattern over rows of the buffer that this sample owns.
   ///
   /// `startRow`/`everyOtherRow` are the field being written, so a pattern lands only on the lines
@@ -1455,7 +1474,7 @@ final class DeckLinkVideoTap {
       glBindBuffer(GLenum(GL_PIXEL_PACK_BUFFER), 0)   // straight to client memory, no PBO
       lock.lock()
       if published.count == w * h * 4 {
-        if weaveFields || interlineFilter {
+        if readbackNeedsStore {
           // Anything that transforms the readback needs a separate source: weaving keeps half of the
           // previous field, and the filter reads neighbouring rows, so writing into the published
           // buffer as we go would consume data we still need. Untransformed output skips this.
@@ -1476,6 +1495,9 @@ final class DeckLinkVideoTap {
             }
           }
           hasFrame = true
+          // Recorded here too, because this branch never reaches `store`, and a trace of a mode that
+          // takes it would otherwise hold handouts and no captures at all.
+          record(kind: 2, flags: 0)
           publishSerial &+= 1
           capturedFrames += 1
           publishedFrames += 1
