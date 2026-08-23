@@ -225,7 +225,14 @@ class DeckLinkController {
     var text = "# mode=\(selectedMode?.name ?? "?") fields=\(fieldMode) order=\(fieldOrder)"
     text += " cadence=\(filmCadence) engaged=\(cadenceEngaged) lowLatency=\(lowLatency)"
     text += " renderAtOutput=\(renderAtOutputResolution) source=\(sourceFrameRate)"
-    text += " holds=\(cadenceHolds) mixed=\(mixedFrames) dup=\(duplicateFrames)\n"
+    text += " holds=\(cadenceHolds) mixed=\(mixedFrames) dup=\(duplicateFrames)"
+    // What the raster actually carries, and which build wrote the file. Both learned the hard way:
+    // a trace that says trueInterlace does not say whether the fields held one moment or two, and a
+    // trace with no build in it cannot be told from one written by the version before the fix, which
+    // cost a whole round of reading the wrong evidence.
+    text += " moments=\(momentsPerOutputFrame.map(String.init) ?? "vary")"
+    let commit = Bundle.main.infoDictionary?["com.colliderli.iina.build.commit"] as? String
+    text += " build=\(commit?.prefix(8) ?? "local")\n"
     text += tap.traceCSV()
     do {
       try text.write(to: url, atomically: true, encoding: .utf8)
@@ -254,6 +261,26 @@ class DeckLinkController {
     }
   }
 
+  /// Distinct source moments in each output frame: 1, 2, or nil when it varies frame to frame.
+  ///
+  /// The one number that answers "is this really interlace", which the mode name cannot. True
+  /// Interlace on a 29.97p file is one moment per frame, PsF in everything but its label, because a
+  /// progressive source has no intermediate field to send and nothing can invent one. The same mode
+  /// on a 59.94p source is two, since consecutive frames land in consecutive fields.
+  ///
+  /// Pass-through is the case the tap cannot answer: the moments are alternate lines inside the
+  /// decoded frame, so whether there are two of them is the decoder's knowledge, not ours. A
+  /// deinterlacer upstream merges them before we are handed anything, which makes it one however the
+  /// raster is labelled.
+  var momentsPerOutputFrame: Int? {
+    guard let mode = selectedMode, mode.isInterlacedOrPsF else { return 1 }
+    switch fieldMode {
+    case .psf: return 1
+    case .sourceInterlaced: return (sourceFrameInterlaced && !sourceDeinterlacing) ? 2 : 1
+    case .trueInterlace: return tap.momentsPerOutputFrame
+    }
+  }
+
   /// Frame rate of the file being shown, as the tap last saw it.
   var sourceFrameRate: Double { tap.sourceRate }
 
@@ -270,6 +297,14 @@ class DeckLinkController {
   /// deinterlacer does the same thing deliberately.
   private(set) var sourceHeight = 0
   private(set) var sourceDeinterlacing = false
+  /// Whether the frame mpv last decoded was flagged interlaced, so pass-through can say whether the
+  /// two moments it forwards are actually there.
+  ///
+  /// mpv publishes this per frame and nothing here read it before, which left the one mode whose
+  /// whole purpose is carrying encoder fields unable to tell them from a progressive frame. Note it
+  /// is the FRAME's flag, not the container's: soft telecined film reports progressive frames with
+  /// repeat flags, which is the right answer for this question.
+  private(set) var sourceFrameInterlaced = false
 
   /// The 525-line raster, and the only one this applies to.
   ///
@@ -943,6 +978,7 @@ class DeckLinkController {
     }
     sourceHeight = mpv.getInt(MPVProperty.videoParamsH)
     sourceDeinterlacing = mpv.getFlag(MPVOption.Video.deinterlace)
+    sourceFrameInterlaced = mpv.getFlag(MPVProperty.videoFrameInfoInterlaced)
   }
 
   private func startSourceRateTimer() {

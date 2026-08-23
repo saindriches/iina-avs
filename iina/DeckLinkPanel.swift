@@ -572,7 +572,16 @@ class DeckLinkPanelController: NSWindowController {
     // Whether a frame carries one moment or two belongs here, describing the signal, rather than
     // tacked onto the build line where it was the thing pushing that line into a second row.
     var signal = raster
-    if mode.isInterlaced, !dl.fieldOrderHasEffect { signal += ", one moment/frame" }
+    // Say it for every interlaced raster, not only where the Field Order control happens to be
+    // inert. "True Interlace" on a progressive source is PsF in all but name, and the number of
+    // moments a frame carries is the only thing that says so plainly.
+    if mode.isInterlacedOrPsF {
+      switch dl.momentsPerOutputFrame {
+      case 1: signal += ", one moment/frame (PsF)"
+      case 2: signal += ", two moments/frame"
+      default: signal += ", moments/frame vary (cadence)"
+      }
+    }
     var lines = ["signal  " + signal]
 
     // -- build, and the capture rate the chosen scheme implies.

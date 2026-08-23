@@ -625,6 +625,31 @@ final class DeckLinkVideoTap {
     return cadenceEngagedLocked && cadenceRatioLocked > 0.5 + 0.001
   }
 
+  /// Distinct source moments in each output frame, or nil when it varies frame to frame.
+  ///
+  /// The question "is this really interlace" reduces to this number, and until now nothing answered
+  /// it. One means the raster is a progressive frame carried in two fields, which is PsF whatever
+  /// the mode is called. Two means the fields are separate instants and the output is interlace in
+  /// the sense a CRT was built for. Nil is the telecine middle ground, where some frames carry two
+  /// and some carry one, and quoting either would be a lie.
+  ///
+  /// Pass-through returns nil because the tap cannot see it: the two moments are inside the decoded
+  /// frame as alternate lines, and only the decoder knows whether they are there. The controller
+  /// answers that case from mpv.
+  var momentsPerOutputFrame: Int? {
+    lock.lock()
+    defer { lock.unlock() }
+    if sourceInterlaced { return nil }
+    guard cadenceEngagedLocked else {
+      // Without the cadence, either each capture is a field of its own (two draws, two moments) or
+      // the starved fallback publishes whole frames (one).
+      return (weaveFields && !weaveStarvedLocked) ? 2 : 1
+    }
+    if cadenceRatioLocked <= 0.5 + 0.001 { return 1 }
+    if cadenceRatioLocked >= 1.0 - 0.001 { return 2 }
+    return nil
+  }
+
   /// Recompute the latched ratio. Safe to call repeatedly: it snaps, so a settled source gives the
   /// same answer every time.
   func refreshCadenceRatio() {
