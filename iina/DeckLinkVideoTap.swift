@@ -625,14 +625,23 @@ final class DeckLinkVideoTap {
 
   /// Whether the two fields of an output frame can hold DIFFERENT moments.
   ///
-  /// They cannot when the source supplies at most one frame per output frame, which is any ratio at
-  /// or below a half: both fields come from the same frame and the output is a whole-frame copy. In
-  /// that case field order has nothing to reorder, so the control is inert and should say so rather
-  /// than appear to work.
+  /// They cannot at a ratio of exactly a half, and only there. One source frame per output frame
+  /// with the phase anchored to the frame boundary means the pull always lands on the trailing
+  /// step, so both fields come from the same frame and there is nothing for an order to reorder.
+  ///
+  /// BELOW a half is not the same thing, which is the mistake this used to make. Fewer source
+  /// frames than output frames on AVERAGE does not put their boundaries on the output frame's
+  /// boundaries: a boundary falls between the two fields with probability r, so exactly that
+  /// fraction of frames pairs two moments. Simulated over the ratios that matter, mixed frames come
+  /// out at 0.3003 for 18p, 0.4000 for 23.976p film, 0.4167 for 25p, and zero only at a half. A
+  /// trace of an 18p file measured 91 of 291 built frames carrying two moments, which is 31%.
+  ///
+  /// So on film, the commonest cadence there is, the field order control was disabled on the 40% of
+  /// frames where it is the only thing deciding which moment goes out first.
   var cadencePairsDistinctMoments: Bool {
     lock.lock()
     defer { lock.unlock() }
-    return cadenceEngagedLocked && cadenceRatioLocked > 0.5 + 0.001
+    return cadenceEngagedLocked && !cadenceIsOneToOne
   }
 
   /// Distinct source moments in each output frame, or nil when it varies frame to frame.
@@ -655,7 +664,10 @@ final class DeckLinkVideoTap {
       // the starved fallback publishes whole frames (one).
       return (weaveFields && !weaveStarvedLocked) ? 2 : 1
     }
-    if cadenceRatioLocked <= 0.5 + 0.001 { return 1 }
+    // One only AT a half, where the anchor pins every pull to the trailing step. Below it the
+    // count varies frame to frame, at the ratio itself: 3 frames in 10 carry two moments at 18p and
+    // 2 in 5 do on film. Quoting one there names the commonest frame and hides the other kind.
+    if cadenceIsOneToOne { return 1 }
     if cadenceRatioLocked >= 1.0 - 0.001 { return 2 }
     return nil
   }

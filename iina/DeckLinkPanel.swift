@@ -477,17 +477,17 @@ class DeckLinkPanelController: NSWindowController {
     if let index = fieldOrders.firstIndex(where: { $0.0 == dl.fieldOrder }) {
       fieldOrderPopUp.selectItem(at: index)
     }
-    // A control that cannot change the output must not look as though it can. In True Interlace on
-    // a source at or below half the field rate, both fields of a frame come from the SAME source
-    // frame, so there is nothing for an order to reorder; pass-through is the mode that still has a
-    // lever there, because its fields are already in the rows.
+    // A control that cannot change the output must not look as though it can, and the converse:
+    // one that CAN must not be greyed out. In True Interlace the only inert ratio is exactly a
+    // half, where the anchor puts one source frame in both fields. Every other cadence pairs two
+    // moments on some fraction of its frames, and on those the order is the whole answer.
     fieldOrderPopUp.isEnabled = dl.fieldOrderHasEffect
     fieldOrderPopUp.toolTip = dl.fieldMode == .sourceInterlaced
       ? NSLocalizedString("menu.decklink_field_order_src_tip",
                           value: "Which field the SOURCE was encoded with first. The card splits the frame by row parity, so when the source disagrees with the raster the picture is shifted one line, which exchanges the two fields without visibly moving anything. Auto assumes the source agrees with the raster.",
                           comment: "")
       : NSLocalizedString("menu.decklink_field_order_tip2",
-                          value: "Which field the card transmits first, and so which one carries the earlier moment.",
+                          value: "Which field the card transmits first, and so which one carries the earlier moment. It decides the frames whose two fields hold different moments, which under a cadence is a fraction of them equal to the ratio: two in five on 23.976p film. Inert only where one source frame fills both fields, which is a 29.97p source in a 59.94 field raster.",
                           comment: "")
 
     filmCadenceBox.state = dl.filmCadence ? .on : .off
