@@ -30,6 +30,7 @@ private struct Keys {
   static let interlineFilter = "decklink.interlineFilter"
   static let filmCadence = "decklink.filmCadence"
   static let scaling = "decklink.scaling"
+  static let displayAspect = "decklink.displayAspect"
   static let compensateAudio = "decklink.compensateAudio"
   static let testPattern = "decklink.testPattern"
   static let testOpacity = "decklink.testOpacity"
@@ -83,6 +84,32 @@ enum DeckLinkScaling: Int {
   /// Distort to fill. Almost never right, but it is what this did before there was a choice, so it
   /// stays available.
   case stretch = 2
+}
+
+/// What shape the SDI raster is meant to be SEEN as, for rasters where the pixel grid does not say.
+///
+/// HD rasters are square-pixel: 1920x1080 and 1280x720 are both 16:9 as counted, so the pixel grid
+/// answers the question and this setting is inert. SD is anamorphic and the pixel grid answers
+/// nothing: 720x486 counts as 1.481, which is neither 4:3 nor 16:9, and the same 720 columns carry
+/// either depending only on what the monitor has been told. So the shape has to be stated, and until
+/// it is, every mapping onto an SD raster is geometrically wrong however carefully it is scaled.
+///
+/// This is the virtual canvas: the picture is fitted or cropped to THIS shape, and the result is then
+/// stretched across the whole raster, which is what anamorphic means. Choosing 4:3 for 16:9 content
+/// with `fill` is how you get the 4:3 portion of a widescreen picture out correctly.
+enum DeckLinkDisplayAspect: Int {
+  /// Follow the source, snapped to whichever of the two the raster can be shown as.
+  case auto = 0
+  case fourThree = 1
+  case sixteenNine = 2
+
+  var ratio: Double? {
+    switch self {
+    case .auto: return nil
+    case .fourThree: return 4.0 / 3.0
+    case .sixteenNine: return 16.0 / 9.0
+    }
+  }
 }
 
 /// Which of the two fields the card transmits first, and so which one carries the earlier moment.
@@ -157,6 +184,12 @@ class DeckLinkController {
 
   /// How a picture of a different shape is mapped onto the SDI raster.
   private(set) var scaling: DeckLinkScaling
+
+  /// The virtual canvas the picture is fitted or cropped to before the raster stretches it.
+  private(set) var displayAspect: DeckLinkDisplayAspect = .auto
+
+  /// The source's shape as it is meant to be seen, its own pixel aspect included.
+  private(set) var sourceDisplayAspect: Double = 0
 
   /// Trim playback speed so production matches the card, instead of repeating a frame when it does
   /// not.
@@ -279,6 +312,41 @@ class DeckLinkController {
     case .sourceInterlaced: return (sourceFrameInterlaced && !sourceDeinterlacing) ? 2 : 1
     case .trueInterlace: return tap.momentsPerOutputFrame
     }
+  }
+
+  /// Whether the selected raster's pixel grid states its own shape.
+  ///
+  /// False for HD, where 1920x1080 and 1280x720 both count as 16:9, so the grid already is the shape
+  /// and this setting has nothing to decide. True for SD, where 720x486 counts as 1.481, which is
+  /// neither 4:3 nor 16:9: the same 720 columns carry either, depending on nothing but what the
+  /// monitor was told, and until it is stated every mapping onto the raster is geometrically wrong
+  /// however carefully it was scaled.
+  var rasterIsAnamorphic: Bool {
+    guard let mode = selectedMode, mode.width > 0, mode.height > 0 else { return false }
+    let counted = Double(mode.width) / Double(mode.height)
+    return abs(counted - 4.0 / 3.0) > 0.01 && abs(counted - 16.0 / 9.0) > 0.01
+  }
+
+  /// The canvas shape to use, or 0 when the pixel grid already says it and nothing is to be imposed.
+  ///
+  /// Auto follows the source and snaps to whichever of 4:3 and 16:9 is nearer, because those are the
+  /// two shapes a monitor can be set to; a canvas of some third ratio would be geometrically right
+  /// and undisplayable. With no source to ask, 4:3 is the safer default for an SD raster, that being
+  /// what an unlabelled SD signal is taken to be.
+  var resolvedDisplayAspect: Double {
+    guard rasterIsAnamorphic else { return 0 }
+    if let fixed = displayAspect.ratio { return fixed }
+    guard sourceDisplayAspect > 0 else { return 4.0 / 3.0 }
+    return abs(sourceDisplayAspect - 4.0 / 3.0) <= abs(sourceDisplayAspect - 16.0 / 9.0)
+      ? 4.0 / 3.0 : 16.0 / 9.0
+  }
+
+  /// Set the canvas. Takes effect on the next frame; the device does not restart.
+  func setDisplayAspect(_ aspect: DeckLinkDisplayAspect) {
+    displayAspect = aspect
+    UserDefaults.standard.set(aspect.rawValue, forKey: Keys.displayAspect)
+    tap.displayAspect = resolvedDisplayAspect
+    notifyChanged()
   }
 
   /// Frame rate of the file being shown, as the tap last saw it.
@@ -556,6 +624,7 @@ class DeckLinkController {
     // either moments or motion.
     filmCadence = d.object(forKey: Keys.filmCadence) as? Bool ?? true
     scaling = DeckLinkScaling(rawValue: d.object(forKey: Keys.scaling) as? Int ?? 0) ?? .fit
+    displayAspect = DeckLinkDisplayAspect(rawValue: d.object(forKey: Keys.displayAspect) as? Int ?? 0) ?? .auto
     compensateAudio = d.bool(forKey: Keys.compensateAudio)
     matchCardClock = d.bool(forKey: Keys.matchCardClock)
     // Pattern is deliberately not persisted; coming back to a test card instead of a picture would
@@ -979,6 +1048,11 @@ class DeckLinkController {
     sourceHeight = mpv.getInt(MPVProperty.videoParamsH)
     sourceDeinterlacing = mpv.getFlag(MPVOption.Video.deinterlace)
     sourceFrameInterlaced = mpv.getFlag(MPVProperty.videoFrameInfoInterlaced)
+    // Display size, not coded size: `dw`/`dh` carry the source's own pixel aspect, which is the
+    // entire question for anamorphic material. Coded 720x480 says nothing on its own either.
+    let dw = mpv.getDouble(MPVProperty.videoParamsDw), dh = mpv.getDouble(MPVProperty.videoParamsDh)
+    sourceDisplayAspect = (dw > 0 && dh > 0) ? dw / dh : 0
+    tap.displayAspect = resolvedDisplayAspect
   }
 
   private func startSourceRateTimer() {
@@ -1121,6 +1195,7 @@ class DeckLinkController {
     let cadenceWanted = weave && filmCadence
     tap.immediateReadback = lowLatency && (!weave || cadenceWanted)
     tap.scaling = scaling
+    tap.displayAspect = resolvedDisplayAspect
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
                  weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),
                  interlineFilter: mode.isInterlacedOrPsF && interlineFilter

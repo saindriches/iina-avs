@@ -50,6 +50,7 @@ class DeckLinkPanelController: NSWindowController {
   private var fieldPopUp: NSPopUpButton!
   private var fieldOrderPopUp: NSPopUpButton!
   private var scalingPopUp: NSPopUpButton!
+  private var displayAspectPopUp: NSPopUpButton!
   private var flipFieldsButton: NSButton!
   private var saveTraceButton: NSButton!
   private var interlineBox: NSButton!
@@ -120,6 +121,9 @@ class DeckLinkPanelController: NSWindowController {
     scalingPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_scaling",
                                                        value: "Aspect Handling", comment: ""),
                           action: #selector(selectScaling(_:)))
+    displayAspectPopUp = addRow(to: stack, NSLocalizedString("menu.decklink_canvas",
+                                                            value: "SD Canvas", comment: ""),
+                                action: #selector(selectDisplayAspect(_:)))
 
     stack.addArrangedSubview(separator())
     stack.addArrangedSubview(sectionLabel(NSLocalizedString("menu.decklink_sdi", value: "SDI Signal", comment: "")))
@@ -396,6 +400,29 @@ class DeckLinkPanelController: NSWindowController {
                                              value: "What to do when the picture and the SDI raster are different shapes. Fit keeps the whole picture and adds bars, which is what a broadcast chain expects. Ignored under Render at Output Resolution, where mpv renders straight into the raster and fits it itself.",
                                              comment: "")
 
+    // The shape an SD raster is meant to be seen as, which its pixel count cannot say. Offered only
+    // where it decides something: HD counts its own shape, and under Render at Output Resolution mpv
+    // owns the geometry, exactly as for Aspect Handling above.
+    let aspects: [(DeckLinkDisplayAspect, String)] = [
+      (.auto, String(format: NSLocalizedString("menu.decklink_canvas_auto",
+                                               value: "Auto (%@)", comment: ""),
+                     abs(dl.resolvedDisplayAspect - 16.0 / 9.0) < 0.01 ? "16:9" : "4:3")),
+      (.fourThree, NSLocalizedString("menu.decklink_canvas_43", value: "4:3", comment: "")),
+      (.sixteenNine, NSLocalizedString("menu.decklink_canvas_169", value: "16:9", comment: "")),
+    ]
+    displayAspectPopUp.removeAllItems()
+    for (value, title) in aspects {
+      displayAspectPopUp.addItem(withTitle: title)
+      displayAspectPopUp.lastItem?.representedObject = value.rawValue
+    }
+    if let index = aspects.firstIndex(where: { $0.0 == dl.displayAspect }) {
+      displayAspectPopUp.selectItem(at: index)
+    }
+    displayAspectPopUp.isEnabled = dl.rasterIsAnamorphic && !dl.renderAtOutputResolution
+    displayAspectPopUp.toolTip = NSLocalizedString("menu.decklink_canvas_tip",
+                                                   value: "What shape an SD raster is meant to be seen as. 720 columns are 4:3 or 16:9 depending only on what the monitor was told, so it has to be stated: the picture is fitted or cropped to this shape and then stretched across the whole raster, which is what anamorphic means. Choose 4:3 with Fill to send the 4:3 middle of a widescreen picture. HD says its own shape, so this applies to SD only, and mpv owns the geometry under Render at Output Resolution.",
+                                                   comment: "")
+
     // -- SDI signal, gated on what the device says it implements
     let caps = dl.capabilities
     let links: [(DeckLinkSDILink, String, Bool)] = [
@@ -575,6 +602,9 @@ class DeckLinkPanelController: NSWindowController {
     // Say it for every interlaced raster, not only where the Field Order control happens to be
     // inert. "True Interlace" on a progressive source is PsF in all but name, and the number of
     // moments a frame carries is the only thing that says so plainly.
+    if dl.rasterIsAnamorphic, dl.resolvedDisplayAspect > 0 {
+      signal += abs(dl.resolvedDisplayAspect - 16.0 / 9.0) < 0.01 ? ", 16:9 canvas" : ", 4:3 canvas"
+    }
     if mode.isInterlacedOrPsF {
       switch dl.momentsPerOutputFrame {
       case 1: signal += ", one moment/frame (PsF)"
@@ -731,6 +761,13 @@ class DeckLinkPanelController: NSWindowController {
     guard let raw = sender.selectedItem?.representedObject as? Int,
           let mode = DeckLinkScaling(rawValue: raw) else { return }
     DeckLinkController.shared.setScaling(mode)
+    refresh()
+  }
+
+  @objc private func selectDisplayAspect(_ sender: NSPopUpButton) {
+    guard let raw = sender.selectedItem?.representedObject as? Int,
+          let aspect = DeckLinkDisplayAspect(rawValue: raw) else { return }
+    DeckLinkController.shared.setDisplayAspect(aspect)
     refresh()
   }
 

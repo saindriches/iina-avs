@@ -880,6 +880,12 @@ final class DeckLinkVideoTap {
   /// How a picture of a different shape is mapped onto the SDI raster.
   var scaling: DeckLinkScaling = .fit
 
+  /// The shape the raster is meant to be SEEN as, or 0 to take the pixel grid at its word.
+  ///
+  /// Set for anamorphic rasters only, which in practice means SD. See the controller for how it is
+  /// resolved; here it is simply the target shape.
+  var displayAspect: Double = 0
+
   /// Where a source of `sourceAspect` lands in a `w` x `h` target, in TOP-DOWN pixels.
   ///
   /// Both blits used to ignore this entirely and just stretch corner to corner, which is wrong in
@@ -893,18 +899,27 @@ final class DeckLinkVideoTap {
       -> (left: Int, top: Int, right: Int, bottom: Int) {
     let full = (left: 0, top: 0, right: w, bottom: h)
     guard sourceAspect > 0, w > 0, h > 0, scaling != .stretch else { return full }
-    let targetAspect = Double(w) / Double(h)
+    // The shape the raster will be SEEN as, which is not the shape it is counted in. Taking the
+    // count as the answer is right for HD by coincidence, since 1920x1080 and 1280x720 both count
+    // 16:9, and wrong for every SD mapping: 720x486 counts 1.481, so a 4:3 picture was being letter
+    // or pillar boxed against a target shape that does not exist on any monitor. Filling the whole
+    // raster IS the anamorphic answer there, and the bars belong against the canvas, not the count.
+    let targetAspect = displayAspect > 0 ? displayAspect : Double(w) / Double(h)
     if abs(sourceAspect - targetAspect) < 0.001 { return full }
 
     // Wider than the target: fit puts bars top and bottom, fill overflows left and right.
+    //
+    // Expressed as a RATIO of the raster rather than from the source's own pixel count, so it is
+    // correct when the raster's count and its shape disagree. The two forms are identical whenever
+    // they agree, which is every HD case, so nothing there moves.
     let widerThanTarget = sourceAspect > targetAspect
     let matchWidth = (scaling == .fit) == widerThanTarget
     if matchWidth {
-      let scaledHeight = Int((Double(w) / sourceAspect).rounded())
+      let scaledHeight = Int((Double(h) * targetAspect / sourceAspect).rounded())
       let offset = (h - scaledHeight) / 2
       return (left: 0, top: offset, right: w, bottom: offset + scaledHeight)
     }
-    let scaledWidth = Int((Double(h) * sourceAspect).rounded())
+    let scaledWidth = Int((Double(w) * sourceAspect / targetAspect).rounded())
     let offset = (w - scaledWidth) / 2
     return (left: offset, top: 0, right: offset + scaledWidth, bottom: h)
   }
