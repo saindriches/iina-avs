@@ -1162,9 +1162,20 @@ final class DeckLinkVideoTap {
         } else {
           memcpy(dstBase, src, rowBytes * h)
         }
-        drawTestPattern(dstBase, width: w, height: h, startRow: 0, everyOtherRow: false)
+        // Per FIELD here, unlike everywhere else in this function, because pass-through is the one
+        // path whose two fields are genuinely two different moments: an interlaced source carries
+        // them as alternate lines inside the frame we just copied. A pattern painted across both at
+        // once steps once per frame and therefore cannot show field order, a dropped field, or a
+        // swapped pair, which is the entire reason the field-order pattern exists. Two calls, a step
+        // apart, put the sweep back on the grid the content is actually on.
+        if testPattern != .off {
+          let firstRow = upperFieldFirst ? 0 : 1
+          drawTestPattern(dstBase, width: w, height: h, startRow: firstRow, everyOtherRow: true)
+          testStep += 1
+          drawTestPattern(dstBase, width: w, height: h, startRow: 1 - firstRow, everyOtherRow: true)
+          testStep += 1
+        }
       }
-      if testPattern != .off { testStep += 1 }
       frameComplete = true
       swap(&working, &published)
       hasFrame = true
