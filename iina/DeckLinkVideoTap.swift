@@ -1202,6 +1202,12 @@ final class DeckLinkVideoTap {
         }
       }
       frameComplete = true
+      // Record it. Only the cadence branch did, so in this mode and the weave below the trace held
+      // handouts and nothing else, and a handout repeat could not be told from phase jitter: the
+      // captures that were overwritten before the card asked for them left no trace of having
+      // existed. Two captures between one handout is over-production; none between two handouts is
+      // the repeat. Both are visible now, and the difference is the whole diagnosis.
+      record(kind: 2, flags: 0)
       swap(&working, &published)
       hasFrame = true
       publishSerial &+= 1
@@ -1254,6 +1260,9 @@ final class DeckLinkVideoTap {
       drawTestPattern(dstBase, width: w, height: h, startRow: first, everyOtherRow: true)
     }
     if testPattern != .off { testStep += 1 }
+    // A capture here is one FIELD while weaving and one frame otherwise, so this is also how the
+    // trace shows which of the two is actually running.
+    record(kind: 2, flags: 0)
     if weaving { fieldParity ^= 1 }
     // Parity back at 0 means the second field of the pair has just landed.
     frameComplete = !weaving || fieldParity == 0
