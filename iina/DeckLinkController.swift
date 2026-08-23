@@ -383,8 +383,13 @@ class DeckLinkController {
   /// file and blank six lines of it for no reason.
   private static let ntscRasterHeight = 486
 
+  /// Which RASTER, not which field mode. The mismatch is a property of 480 lines meeting 486 and it
+  /// is there whoever is assembling the fields: True Interlace scaling 480 into 486 averages each
+  /// line with its neighbour, and in an interlaced raster the neighbour is the other field, so it
+  /// destroys the same thing a pass-through would lose. Gating this on pass-through is what left a
+  /// 640x480 file being scaled vertically in the mode that cares most.
   var usesLinePlacement: Bool {
-    guard let mode = selectedMode, fieldMode == .sourceInterlaced else { return false }
+    guard let mode = selectedMode else { return false }
     return mode.height == Self.ntscRasterHeight && sourceHeight > 0 && sourceHeight < mode.height
   }
 

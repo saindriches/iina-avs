@@ -75,7 +75,17 @@ final class DeckLinkVideoTap {
   func setLinePlacement(sourceHeight: Int, rasterHeight: Int) {
     lock.lock()
     defer { lock.unlock() }
-    guard sourceInterlaced, sourceHeight > 0, sourceHeight < rasterHeight else {
+    // Not a pass-through concept, which is how it was gated at first. Any interlaced raster has the
+    // same problem: resampling 480 lines into 486 averages each line with its neighbour, and in an
+    // interlaced raster the neighbour is the OTHER field, so the two moments are blended before
+    // anything downstream can separate them. A 640x480 file into 525i was being scaled vertically
+    // for exactly this reason, in the one mode that cares most.
+    //
+    // Only for a source whose active lines ARE the raster's, give or take a convention. Six lines is
+    // 480 in 486; three hundred is a picture that wants scaling up, and placing it would leave it
+    // small in the middle of a black frame. Sixteen is comfortably above every real convention and
+    // far below any case where scaling is what was meant.
+    guard sourceHeight > 0, sourceHeight < rasterHeight, rasterHeight - sourceHeight <= 16 else {
       placedHeight = 0
       placedTopOffset = 0
       return
@@ -1224,7 +1234,7 @@ final class DeckLinkVideoTap {
     if sourceInterlaced {
       working.withUnsafeMutableBytes { raw in
         guard let dstBase = raw.baseAddress else { return }
-        if placedHeight > 0 {
+        if placedHeight > 0, !placementAppliedInGL {
           // mpv rendered into the top `placedHeight` rows of the target, so move them down to the
           // placement line and blank the rest. Field Order still adds its one line on top, which is
           // the escape hatch if the chain wants the opposite parity.
@@ -1358,11 +1368,20 @@ final class DeckLinkVideoTap {
   /// Its height is the raster's, so the vertical scale is 1:1 and only the horizontal one does work.
   /// Caller holds `lock`.
   private func canvasGeometryLocked(rasterW w: Int, rasterH h: Int) -> (width: Int, height: Int)? {
-    guard displayAspect > 0, placedHeight == 0, sourceAspect > 0, w > 0, h > 0 else { return nil }
-    let width = Int((Double(h) * sourceAspect).rounded())
+    guard displayAspect > 0, sourceAspect > 0, w > 0, h > 0 else { return nil }
+    // A placement fixes the height at the source's own active lines, and the blit then puts them
+    // where they belong. That is what makes the vertical 1:1: a 640x480 source gets a canvas of
+    // exactly 640x480, so mpv resamples nothing at all and only the horizontal stretch to 720 is
+    // ever done, which is what anamorphic asks for and all it asks for.
+    let boxHeight = placedHeight > 0 ? placedHeight : h
+    let width = Int((Double(boxHeight) * sourceAspect).rounded())
     guard width >= 16, width <= 8192 else { return nil }
-    return (width, h)
+    return (width, boxHeight)
   }
+
+  /// Whether the GL blit already put the picture on its placement lines, so `store` must not do it
+  /// again. Two mechanisms for one job is how a thing gets applied twice.
+  private var placementAppliedInGL = false
 
   /// Same two-format fallback as the raster's own framebuffer, for the same reason.
   private func ensureCanvasFramebuffer(width: Int, height: Int) -> Bool {
@@ -1443,6 +1462,8 @@ final class DeckLinkVideoTap {
 
     guard shouldSample(at: CACurrentMediaTime()) else { return }
     guard ensureFramebuffer(width: w, height: h) else { return }
+    // This path has no canvas, so whatever the other one last did about placement does not hold.
+    lock.lock(); placementAppliedInGL = false; lock.unlock()
 
     // Save the caller's binding and viewport; ViewLayer keeps rendering into its own FBO after us.
     var prevDrawFBO: GLint = 0
@@ -1481,6 +1502,8 @@ final class DeckLinkVideoTap {
     let w = targetWidth, h = targetHeight
     let canvas = canvasGeometryLocked(rasterW: w, rasterH: h)
     let aspect = sourceAspect
+    let placeTop = placedTopOffset
+    let placeHeight = placedHeight
     lock.unlock()
     guard w > 0, h > 0, ensureFramebuffer(width: w, height: h) else { return false }
     hookCalls += 1
@@ -1510,7 +1533,8 @@ final class DeckLinkVideoTap {
     var depth: CInt = 10
     // Render into only the rows the source actually has, when placing rather than scaling. mpv
     // fills the region it is given, so asking for the source height is what keeps it 1:1.
-    let renderHeight = placedHeight > 0 ? placedHeight : (useCanvas ? canvas!.height : h)
+    lock.lock(); placementAppliedInGL = useCanvas && placeHeight > 0; lock.unlock()
+    let renderHeight = useCanvas ? canvas!.height : (placeHeight > 0 ? placeHeight : h)
     var data = mpv_opengl_fbo(fbo: Int32(renderFBO), w: Int32(renderWidth), h: Int32(renderHeight),
                               internal_format: 0)
     withUnsafeMutablePointer(to: &data) { dataPtr in
@@ -1543,9 +1567,15 @@ final class DeckLinkVideoTap {
     // which is the crop. Y is converted rather than flipped: mpv rendered unflipped into the canvas,
     // so both buffers already agree, and a rect measured top-down becomes a GL range measured up.
     if useCanvas {
-      let rect = destinationRect(sourceAspect: aspect,
-                                 targetAspect: rasterShape(width: w, height: h),
-                                 width: w, height: h)
+      // Fit or crop inside the BOX the placement defines, then move the whole box onto its lines.
+      // The 480 placed lines are the picture, and the six spare ones are blanking a tube never
+      // shows, so the box is what carries the display shape and the full raster is not.
+      let box = placeHeight > 0 ? placeHeight : h
+      let inner = destinationRect(sourceAspect: aspect,
+                                  targetAspect: rasterShape(width: w, height: h),
+                                  width: w, height: box)
+      let rect = (left: inner.left, top: inner.top + placeTop,
+                  right: inner.right, bottom: inner.bottom + placeTop)
       glBindFramebuffer(GLenum(GL_DRAW_FRAMEBUFFER), fbo)
       glBindFramebuffer(GLenum(GL_READ_FRAMEBUFFER), canvasFBO)
       glReadBuffer(GLenum(GL_COLOR_ATTACHMENT0))
