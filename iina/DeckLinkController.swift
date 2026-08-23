@@ -1052,6 +1052,7 @@ class DeckLinkController {
     // entire question for anamorphic material. Coded 720x480 says nothing on its own either.
     let dw = mpv.getDouble(MPVProperty.videoParamsDw), dh = mpv.getDouble(MPVProperty.videoParamsDh)
     sourceDisplayAspect = (dw > 0 && dh > 0) ? dw / dh : 0
+    tap.sourceAspect = sourceDisplayAspect
     tap.displayAspect = resolvedDisplayAspect
   }
 
@@ -1195,6 +1196,7 @@ class DeckLinkController {
     let cadenceWanted = weave && filmCadence
     tap.immediateReadback = lowLatency && (!weave || cadenceWanted)
     tap.scaling = scaling
+    tap.sourceAspect = sourceDisplayAspect
     tap.displayAspect = resolvedDisplayAspect
     tap.activate(width: mode.width, height: mode.height, fps: mode.fps,
                  weaveFields: weave, upperFieldFirst: upperFieldFirst(for: mode),

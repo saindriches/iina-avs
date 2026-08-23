@@ -871,6 +871,16 @@ final class DeckLinkVideoTap {
   /// Ping-ponged pixel buffer objects: glReadPixels into one (returns immediately, the GPU fills it
   /// in the background) while mapping the one filled last time. Costs one frame of latency and
   /// removes the pipeline stall that a synchronous readback causes.
+  /// A square-pixel staging buffer, shaped like the SOURCE, for anamorphic rasters.
+  ///
+  /// mpv cannot letterbox correctly into a raster whose pixel count is not its shape, and it has no
+  /// way to be told the difference. Giving it a canvas of the source's own shape means it fills that
+  /// edge to edge and adds no bars of its own, which leaves every geometric decision here, where the
+  /// raster's real shape is known. One extra blit, on SD, which is nothing.
+  private var canvasFBO: GLuint = 0
+  private var canvasTexture: GLuint = 0
+  private var canvasWidth = 0
+  private var canvasHeight = 0
   private var pbos: [GLuint] = [0, 0]
   private var pboIndex = 0
   private var pboPrimed = false
@@ -880,13 +890,31 @@ final class DeckLinkVideoTap {
   /// How a picture of a different shape is mapped onto the SDI raster.
   var scaling: DeckLinkScaling = .fit
 
+  /// The source's shape as it is meant to be seen, its own pixel aspect included. 0 when unknown.
+  var sourceAspect: Double = 0
+
   /// The shape the raster is meant to be SEEN as, or 0 to take the pixel grid at its word.
   ///
   /// Set for anamorphic rasters only, which in practice means SD. See the controller for how it is
   /// resolved; here it is simply the target shape.
   var displayAspect: Double = 0
 
-  /// Where a source of `sourceAspect` lands in a `w` x `h` target, in TOP-DOWN pixels.
+  /// The shape the raster is SEEN as, which is not the shape it is counted in.
+  ///
+  /// Taking the count as the answer is right for HD by coincidence, since 1920x1080 and 1280x720 both
+  /// count 16:9, and wrong for every SD mapping: 720x486 counts 1.481, so a 4:3 picture was being
+  /// boxed against a target shape that exists on no monitor. Filling the whole raster IS the
+  /// anamorphic answer there.
+  private func rasterShape(width w: Int, height h: Int) -> Double {
+    displayAspect > 0 ? displayAspect : (h > 0 ? Double(w) / Double(h) : 0)
+  }
+
+  /// Where a source of `sourceAspect` lands in a target of `targetAspect`, in TOP-DOWN pixels.
+  ///
+  /// Both aspects are passed rather than inferred, because the two ends of a blit can each be either
+  /// square-pixel or anamorphic and only the caller knows which: the same raster is the TARGET when
+  /// a picture is being mapped onto it and the SOURCE when it is previewed to the window, and an
+  /// implicit rule that suits one of those is silently wrong for the other.
   ///
   /// Both blits used to ignore this entirely and just stretch corner to corner, which is wrong in
   /// both directions: a 4:3 window went out as a 16:9 raster stretched, and a 16:9 raster came back
@@ -895,16 +923,11 @@ final class DeckLinkVideoTap {
   ///
   /// `fill` deliberately returns a rectangle larger than the target; the blit clips it, which is the
   /// crop. `stretch` returns the target, which is the old behaviour.
-  private func destinationRect(sourceAspect: Double, width w: Int, height h: Int)
+  private func destinationRect(sourceAspect: Double, targetAspect: Double,
+                              width w: Int, height h: Int)
       -> (left: Int, top: Int, right: Int, bottom: Int) {
     let full = (left: 0, top: 0, right: w, bottom: h)
-    guard sourceAspect > 0, w > 0, h > 0, scaling != .stretch else { return full }
-    // The shape the raster will be SEEN as, which is not the shape it is counted in. Taking the
-    // count as the answer is right for HD by coincidence, since 1920x1080 and 1280x720 both count
-    // 16:9, and wrong for every SD mapping: 720x486 counts 1.481, so a 4:3 picture was being letter
-    // or pillar boxed against a target shape that does not exist on any monitor. Filling the whole
-    // raster IS the anamorphic answer there, and the bars belong against the canvas, not the count.
-    let targetAspect = displayAspect > 0 ? displayAspect : Double(w) / Double(h)
+    guard sourceAspect > 0, targetAspect > 0, w > 0, h > 0, scaling != .stretch else { return full }
     if abs(sourceAspect - targetAspect) < 0.001 { return full }
 
     // Wider than the target: fit puts bars top and bottom, fill overflows left and right.
@@ -930,8 +953,10 @@ final class DeckLinkVideoTap {
   /// window both want the top first. Bars are cleared to black rather than left as whatever the
   /// previous frame put there.
   private func blitPreservingAspect(sourceWidth sw: Int, sourceHeight sh: Int,
-                                    destWidth dw: Int, destHeight dh: Int) {
-    let rect = destinationRect(sourceAspect: sh > 0 ? Double(sw) / Double(sh) : 0,
+                                    destWidth dw: Int, destHeight dh: Int,
+                                    sourceAspect: Double? = nil, targetAspect: Double? = nil) {
+    let rect = destinationRect(sourceAspect: sourceAspect ?? (sh > 0 ? Double(sw) / Double(sh) : 0),
+                               targetAspect: targetAspect ?? (dh > 0 ? Double(dw) / Double(dh) : 0),
                                width: dw, height: dh)
     if rect.left > 0 || rect.top > 0 || rect.right < dw || rect.bottom < dh {
       glClearColor(0, 0, 0, 1)
@@ -1323,11 +1348,62 @@ final class DeckLinkVideoTap {
     lock.unlock()
   }
 
+  /// The canvas to render into, or nil to render straight at the raster as before.
+  ///
+  /// Wanted only where the raster's pixel count is not its shape, which is SD, and only when the
+  /// picture is being scaled at all: with a line placement in force the source is already the
+  /// raster's own height and goes across 1:1, and putting a resample in front of that would blend
+  /// the very lines the placement exists to keep apart.
+  ///
+  /// Its height is the raster's, so the vertical scale is 1:1 and only the horizontal one does work.
+  /// Caller holds `lock`.
+  private func canvasGeometryLocked(rasterW w: Int, rasterH h: Int) -> (width: Int, height: Int)? {
+    guard displayAspect > 0, placedHeight == 0, sourceAspect > 0, w > 0, h > 0 else { return nil }
+    let width = Int((Double(h) * sourceAspect).rounded())
+    guard width >= 16, width <= 8192 else { return nil }
+    return (width, h)
+  }
+
+  /// Same two-format fallback as the raster's own framebuffer, for the same reason.
+  private func ensureCanvasFramebuffer(width: Int, height: Int) -> Bool {
+    if canvasFBO != 0, canvasWidth == width, canvasHeight == height { return true }
+    releaseCanvasResources()
+    for internalFormat in [GL_RGB10_A2, GL_RGBA8] {
+      glGenTextures(1, &canvasTexture)
+      glBindTexture(GLenum(GL_TEXTURE_2D), canvasTexture)
+      glTexImage2D(GLenum(GL_TEXTURE_2D), 0, internalFormat, GLsizei(width), GLsizei(height), 0,
+                   GLenum(GL_BGRA), GLenum(GL_UNSIGNED_INT_2_10_10_10_REV), nil)
+      glTexParameteri(GLenum(GL_TEXTURE_2D), GLenum(GL_TEXTURE_MIN_FILTER), GL_LINEAR)
+      glTexParameteri(GLenum(GL_TEXTURE_2D), GLenum(GL_TEXTURE_MAG_FILTER), GL_LINEAR)
+      glTexParameteri(GLenum(GL_TEXTURE_2D), GLenum(GL_TEXTURE_WRAP_S), GL_CLAMP_TO_EDGE)
+      glTexParameteri(GLenum(GL_TEXTURE_2D), GLenum(GL_TEXTURE_WRAP_T), GL_CLAMP_TO_EDGE)
+      glGenFramebuffers(1, &canvasFBO)
+      glBindFramebuffer(GLenum(GL_FRAMEBUFFER), canvasFBO)
+      glFramebufferTexture2D(GLenum(GL_FRAMEBUFFER), GLenum(GL_COLOR_ATTACHMENT0),
+                             GLenum(GL_TEXTURE_2D), canvasTexture, 0)
+      if glCheckFramebufferStatus(GLenum(GL_FRAMEBUFFER)) == GLenum(GL_FRAMEBUFFER_COMPLETE) {
+        canvasWidth = width
+        canvasHeight = height
+        return true
+      }
+      releaseCanvasResources()
+    }
+    return false
+  }
+
+  private func releaseCanvasResources() {
+    if canvasTexture != 0 { glDeleteTextures(1, &canvasTexture); canvasTexture = 0 }
+    if canvasFBO != 0 { glDeleteFramebuffers(1, &canvasFBO); canvasFBO = 0 }
+    canvasWidth = 0
+    canvasHeight = 0
+  }
+
   /// Must be called with the GL context current (ViewLayer teardown).
   func releaseGLResources() {
     if texture != 0 { glDeleteTextures(1, &texture); texture = 0 }
     if fbo != 0 { glDeleteFramebuffers(1, &fbo); fbo = 0 }
     if pbos[0] != 0 || pbos[1] != 0 { glDeleteBuffers(2, &pbos); pbos = [0, 0] }
+    releaseCanvasResources()
     forgetGLResources()
   }
 
@@ -1336,6 +1412,10 @@ final class DeckLinkVideoTap {
   private func forgetGLResources() {
     texture = 0
     fbo = 0
+    canvasTexture = 0
+    canvasFBO = 0
+    canvasWidth = 0
+    canvasHeight = 0
     pbos = [0, 0]
     pboPrimed = false
     pboIndex = 0
@@ -1379,7 +1459,8 @@ final class DeckLinkVideoTap {
     glBindFramebuffer(GLenum(GL_DRAW_FRAMEBUFFER), fbo)
     glViewport(0, 0, GLsizei(w), GLsizei(h))   // glClear obeys the viewport's scissor-free bounds
     blitPreservingAspect(sourceWidth: sourceWidth, sourceHeight: sourceHeight,
-                         destWidth: w, destHeight: h)
+                         destWidth: w, destHeight: h,
+                         targetAspect: rasterShape(width: w, height: h))
 
     readBackCurrentFBO(width: w, height: h)
 
@@ -1398,6 +1479,8 @@ final class DeckLinkVideoTap {
                        screenWidth: Int, screenHeight: Int) -> Bool {
     lock.lock()
     let w = targetWidth, h = targetHeight
+    let canvas = canvasGeometryLocked(rasterW: w, rasterH: h)
+    let aspect = sourceAspect
     lock.unlock()
     guard w > 0, h > 0, ensureFramebuffer(width: w, height: h) else { return false }
     hookCalls += 1
@@ -1405,8 +1488,15 @@ final class DeckLinkVideoTap {
     var prevViewport: [GLint] = [0, 0, 0, 0]
     glGetIntegerv(GLenum(GL_VIEWPORT), &prevViewport)
 
-    glBindFramebuffer(GLenum(GL_FRAMEBUFFER), fbo)
-    glViewport(0, 0, GLsizei(w), GLsizei(h))
+    // Render at the canvas when there is one, and stretch it onto the raster afterwards. mpv is
+    // given a target of the source's own shape, so it fills it and never adds a bar we would have to
+    // reason around; the shape of the raster is then entirely this code's business.
+    let useCanvas = canvas != nil && ensureCanvasFramebuffer(width: canvas!.width, height: canvas!.height)
+    let renderFBO = useCanvas ? canvasFBO : fbo
+    let renderWidth = useCanvas ? canvas!.width : w
+
+    glBindFramebuffer(GLenum(GL_FRAMEBUFFER), renderFBO)
+    glViewport(0, 0, GLsizei(renderWidth), GLsizei(useCanvas ? canvas!.height : h))
     if placedHeight > 0 {
       glClearColor(0, 0, 0, 1)   // the rows outside the placement must be blanking, not last frame
       glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
@@ -1420,8 +1510,9 @@ final class DeckLinkVideoTap {
     var depth: CInt = 10
     // Render into only the rows the source actually has, when placing rather than scaling. mpv
     // fills the region it is given, so asking for the source height is what keeps it 1:1.
-    let renderHeight = placedHeight > 0 ? placedHeight : h
-    var data = mpv_opengl_fbo(fbo: Int32(fbo), w: Int32(w), h: Int32(renderHeight), internal_format: 0)
+    let renderHeight = placedHeight > 0 ? placedHeight : (useCanvas ? canvas!.height : h)
+    var data = mpv_opengl_fbo(fbo: Int32(renderFBO), w: Int32(renderWidth), h: Int32(renderHeight),
+                              internal_format: 0)
     withUnsafeMutablePointer(to: &data) { dataPtr in
       withUnsafeMutablePointer(to: &flip) { flipPtr in
         withUnsafeMutablePointer(to: &depth) { depthPtr in
@@ -1446,6 +1537,30 @@ final class DeckLinkVideoTap {
     // at 29.97, so one checkbox changed the rate for no reason anyone could see. Producing faster
     // than the card consumes buys nothing but heat, and the work it wastes is what the filter and
     // the field-rate weave need: measured, the filter alone cost three draws a second.
+    // Canvas onto raster: one blit, source shaped like the picture and destination shaped like the
+    // signal, which is exactly what anamorphic means. `destinationRect` decides where it lands, and
+    // for Fill it deliberately returns a rectangle larger than the raster so the blit clips it,
+    // which is the crop. Y is converted rather than flipped: mpv rendered unflipped into the canvas,
+    // so both buffers already agree, and a rect measured top-down becomes a GL range measured up.
+    if useCanvas {
+      let rect = destinationRect(sourceAspect: aspect,
+                                 targetAspect: rasterShape(width: w, height: h),
+                                 width: w, height: h)
+      glBindFramebuffer(GLenum(GL_DRAW_FRAMEBUFFER), fbo)
+      glBindFramebuffer(GLenum(GL_READ_FRAMEBUFFER), canvasFBO)
+      glReadBuffer(GLenum(GL_COLOR_ATTACHMENT0))
+      glViewport(0, 0, GLsizei(w), GLsizei(h))
+      if rect.left > 0 || rect.top > 0 || rect.right < w || rect.bottom < h {
+        glClearColor(0, 0, 0, 1)
+        glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
+      }
+      glBlitFramebuffer(0, 0, GLint(canvas!.width), GLint(canvas!.height),
+                        GLint(rect.left), GLint(h - rect.bottom),
+                        GLint(rect.right), GLint(h - rect.top),
+                        GLbitfield(GL_COLOR_BUFFER_BIT), GLenum(GL_LINEAR))
+      glBindFramebuffer(GLenum(GL_FRAMEBUFFER), fbo)
+    }
+
     if shouldSample(at: CACurrentMediaTime()) {
       readBackCurrentFBO(width: w, height: h)
     }
@@ -1464,7 +1579,8 @@ final class DeckLinkVideoTap {
     glBindFramebuffer(GLenum(GL_DRAW_FRAMEBUFFER), screenFBO)
     glViewport(0, 0, GLsizei(screenWidth), GLsizei(screenHeight))
     blitPreservingAspect(sourceWidth: w, sourceHeight: h,
-                         destWidth: screenWidth, destHeight: screenHeight)
+                         destWidth: screenWidth, destHeight: screenHeight,
+                         sourceAspect: rasterShape(width: w, height: h))
     scaling = previewScaling
 
     // Leave the viewport describing the SCREEN, not whatever it was on entry. Restoring the value

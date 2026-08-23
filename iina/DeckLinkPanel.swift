@@ -395,9 +395,13 @@ class DeckLinkPanelController: NSWindowController {
     }
     // With Render at Output Resolution on, mpv draws into the raster and does the fitting itself,
     // so this has nothing left to decide. Say so by disabling it rather than letting it look live.
-    scalingPopUp.isEnabled = !dl.renderAtOutputResolution
+    //
+    // Except on an anamorphic raster, where mpv cannot do the fitting: it would be fitting to a
+    // pixel count that is not the shape. There we render at a canvas of the source's own shape and
+    // do the mapping ourselves, so this decides something again.
+    scalingPopUp.isEnabled = !dl.renderAtOutputResolution || dl.rasterIsAnamorphic
     scalingPopUp.toolTip = NSLocalizedString("menu.decklink_scaling_tip",
-                                             value: "What to do when the picture and the SDI raster are different shapes. Fit keeps the whole picture and adds bars, which is what a broadcast chain expects. Ignored under Render at Output Resolution, where mpv renders straight into the raster and fits it itself.",
+                                             value: "What to do when the picture and the SDI raster are different shapes. Fit keeps the whole picture and adds bars, which is what a broadcast chain expects. Ignored under Render at Output Resolution, where mpv renders straight into the raster and fits it itself, except on an SD raster, whose shape mpv cannot be told.",
                                              comment: "")
 
     // The shape an SD raster is meant to be seen as, which its pixel count cannot say. Offered only
@@ -418,9 +422,9 @@ class DeckLinkPanelController: NSWindowController {
     if let index = aspects.firstIndex(where: { $0.0 == dl.displayAspect }) {
       displayAspectPopUp.selectItem(at: index)
     }
-    displayAspectPopUp.isEnabled = dl.rasterIsAnamorphic && !dl.renderAtOutputResolution
+    displayAspectPopUp.isEnabled = dl.rasterIsAnamorphic
     displayAspectPopUp.toolTip = NSLocalizedString("menu.decklink_canvas_tip",
-                                                   value: "What shape an SD raster is meant to be seen as. 720 columns are 4:3 or 16:9 depending only on what the monitor was told, so it has to be stated: the picture is fitted or cropped to this shape and then stretched across the whole raster, which is what anamorphic means. Choose 4:3 with Fill to send the 4:3 middle of a widescreen picture. HD says its own shape, so this applies to SD only, and mpv owns the geometry under Render at Output Resolution.",
+                                                   value: "What shape an SD raster is meant to be seen as. 720 columns are 4:3 or 16:9 depending only on what the monitor was told, so it has to be stated: the picture is fitted or cropped to this shape and then stretched across the whole raster, which is what anamorphic means. Choose 4:3 with Fill to send the 4:3 middle of a widescreen picture. HD says its own shape, so this applies to SD only.",
                                                    comment: "")
 
     // -- SDI signal, gated on what the device says it implements
