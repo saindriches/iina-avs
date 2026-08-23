@@ -56,6 +56,18 @@ final class DeckLinkVideoTap {
   /// rows destroys them. So no weaving, no cadence, no filter, and no vertical resampling upstream
   /// either, which is the one precondition the tap cannot enforce for itself.
   var sourceInterlaced = false
+
+  /// Whether the frames mpv is handing over are themselves interlaced, whatever mode we are in.
+  ///
+  /// Not the same thing as `sourceInterlaced` above, which is a MODE. This is a FACT about the
+  /// content, and the cadence needs it: the cadence's whole model is that one source frame is one
+  /// instant, which is true of progressive material and false here, where the alternate lines of a
+  /// single frame are already two instants. Pairing a field of one such frame with a field of the
+  /// next welds two different pictures into one raster.
+  ///
+  /// mpv publishes it per frame and the controller polls it; nothing in the cadence path had ever
+  /// been told.
+  var sourceFramesInterlaced = false
   /// SD line placement, for 525-line only. Zero when it does not apply.
   ///
   /// DeckLink's NTSC raster is 720x486, the full BT.601 active picture, while almost every file is
@@ -638,10 +650,15 @@ final class DeckLinkVideoTap {
   ///
   /// So on film, the commonest cadence there is, the field order control was disabled on the 40% of
   /// frames where it is the only thing deciding which moment goes out first.
+  ///
+  /// An interlaced source makes it true at EVERY ratio, a half included: both fields come from one
+  /// frame there, but that frame's alternate lines are two instants of its own, and which of them
+  /// goes out first is precisely what the control decides.
   var cadencePairsDistinctMoments: Bool {
     lock.lock()
     defer { lock.unlock() }
-    return cadenceEngagedLocked && !cadenceIsOneToOne
+    guard cadenceEngagedLocked else { return false }
+    return sourceFramesInterlaced || !cadenceIsOneToOne
   }
 
   /// Distinct source moments in each output frame, or nil when it varies frame to frame.
@@ -664,6 +681,10 @@ final class DeckLinkVideoTap {
       // the starved fallback publishes whole frames (one).
       return (weaveFields && !weaveStarvedLocked) ? 2 : 1
     }
+    // Always two on an interlaced source: every output frame is one source frame's own field pair,
+    // and the cadence no longer splits it. That is the one configuration here where True Interlace
+    // is interlace in the sense a CRT was built for, rather than PsF wearing its name.
+    if sourceFramesInterlaced { return 2 }
     // One only AT a half, where the anchor pins every pull to the trailing step. Below it the
     // count varies frame to frame, at the ratio itself: 3 frames in 10 carry two moments at 18p and
     // 2 in 5 do on film. Quoting one there names the commonest frame and hides the other kind.
@@ -1837,17 +1858,37 @@ final class DeckLinkVideoTap {
     let firstSource = current
     let consumedBefore = sourceConsumed
     if stepCadenceSlot() { pullCadenceFrame() }
-    let secondSource = current
-    let mixed = sourceConsumed != consumedBefore
+
+    // Both fields from ONE source frame when the frames are already interlaced.
+    //
+    // The cadence assumes a source frame is one instant, so pairing this frame's earlier field with
+    // the NEXT frame's later field is the correct way to sample motion. On interlaced material the
+    // assumption is false and the result is wrong in a way that dwarfs any judder: the two moments
+    // are ALREADY the alternate lines of a single frame, so a split takes frame N's top field and
+    // frame N+1's bottom field and transmits them as one picture. Motion then runs forward, back,
+    // forward, once for every source boundary that lands between two fields. Measured on 50i into
+    // 1080i59.94, ratio 0.4171, that is 257 of 620 frames.
+    //
+    // Taking both fields from the one frame reproduces the encoder's own pair exactly, since the
+    // blit splits rows 0,2,4 and 1,3,5 of a frame that already holds them that way. The rate
+    // difference then shows up as whole frames repeating, which is judder and is unavoidable at
+    // 25 into 29.97, rather than as two pictures welded together.
+    //
+    // The pull still happens on its own schedule; only its USE is deferred to the next frame, so
+    // consumption and phase are untouched. At any ratio below a half one slot pair can wrap only
+    // once, so nothing is skipped either.
+    let pairedAcrossFrames = !sourceFramesInterlaced && sourceConsumed != consumedBefore
+    let secondSource = pairedAcrossFrames ? current : firstSource
     // Counted only where it is a fault. Below a half a leading-step pull is the telecine pattern
     // itself: at 0.4 the pull falls on the leading step of 160 frames in every 400, which is the 2:3
     // of film and exactly what the cadence exists to produce. Counting those would put a four figure
     // number next to the word mixed on ordinary film content and bury the case that matters.
     // The trace flag below is NOT gated, so the per-frame truth is still in the ring either way.
-    if mixed, cadenceIsOneToOne { mixedFrames += 1 }
+    if pairedAcrossFrames, cadenceIsOneToOne { mixedFrames += 1 }
     // The leading-step pull is the tell for a slipped phase: at or below half the field rate it
-    // should never happen, because the wrap belongs on the trailing step.
-    record(kind: 1, flags: mixed ? 0b10010 : 0,
+    // should never happen, because the wrap belongs on the trailing step. On interlaced source it
+    // cannot be set at all now, which is what makes its absence the confirmation in a trace.
+    record(kind: 1, flags: pairedAcrossFrames ? 0b10010 : 0,
            fieldA: Int32(truncatingIfNeeded: consumedBefore),
            fieldB: Int32(truncatingIfNeeded: sourceConsumed))
 

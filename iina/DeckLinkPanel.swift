@@ -615,6 +615,15 @@ class DeckLinkPanelController: NSWindowController {
       case 2: signal += ", two moments/frame"
       default: signal += ", moments/frame vary (cadence)"
       }
+      // Say what the SOURCE is, because it changes what every mode here can honestly do and was
+      // invisible before: the cadence pairs interlaced frames differently, pass-through has real
+      // fields to forward only on interlaced source, and a deinterlacer upstream silently makes
+      // both questions moot by merging the two moments before we are handed anything.
+      if dl.sourceDeinterlacing {
+        signal += ", source deinterlaced upstream"
+      } else if dl.sourceFrameInterlaced {
+        signal += ", interlaced source"
+      }
     }
     var lines = ["signal  " + signal]
 

@@ -264,6 +264,9 @@ class DeckLinkController {
     // trace with no build in it cannot be told from one written by the version before the fix, which
     // cost a whole round of reading the wrong evidence.
     text += " moments=\(momentsPerOutputFrame.map(String.init) ?? "vary")"
+    // Whether the SOURCE frames are interlaced decides how the cadence may pair them, so a trace
+    // cannot be read without it. Absent from every trace before this.
+    text += " srcFields=\(sourceFrameInterlaced ? (sourceDeinterlacing ? "deint" : "interlaced") : "progressive")"
     let commit = Bundle.main.infoDictionary?["com.colliderli.iina.build.commit"] as? String
     text += " build=\(commit?.prefix(8) ?? "local")\n"
     text += tap.traceCSV()
@@ -1053,6 +1056,10 @@ class DeckLinkController {
     sourceHeight = mpv.getInt(MPVProperty.videoParamsH)
     sourceDeinterlacing = mpv.getFlag(MPVOption.Video.deinterlace)
     sourceFrameInterlaced = mpv.getFlag(MPVProperty.videoFrameInfoInterlaced)
+    // The cadence needs this too, not only pass-through: it must not pair a field of one interlaced
+    // frame with a field of the next. A deinterlacer upstream has already merged the two moments, so
+    // the frames really are progressive by then and the ordinary cadence is right again.
+    tap.sourceFramesInterlaced = sourceFrameInterlaced && !sourceDeinterlacing
     // Display size, not coded size: `dw`/`dh` carry the source's own pixel aspect, which is the
     // entire question for anamorphic material. Coded 720x480 says nothing on its own either.
     let dw = mpv.getDouble(MPVProperty.videoParamsDw), dh = mpv.getDouble(MPVProperty.videoParamsDh)
@@ -1180,6 +1187,9 @@ class DeckLinkController {
     // filter, since the filter averages the rows either side of each line and those rows are the
     // other field.
     tap.sourceInterlaced = mode.isInterlaced && fieldMode == .sourceInterlaced
+    // Carried across a re-arm as well as on the poll, or a mode change would run the cadence on its
+    // progressive assumption until the next tick happened to correct it.
+    tap.sourceFramesInterlaced = sourceFrameInterlaced && !sourceDeinterlacing
     // In pass-through the setting names the SOURCE's field order, and a shift is needed only when
     // that disagrees with the raster's. Wiring it as "lowerFirst means swap" was wrong wherever the
     // card is already lower first, which NTSC is: Auto and Upper then both did nothing, and the
